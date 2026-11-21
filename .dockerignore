@@ -1,0 +1,11 @@
+.git
+.github
+bench
+docs
+engine
+deploy
+tests
+**/__pycache__
+.env
+*.md
+!README.md

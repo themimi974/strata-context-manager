@@ -1,0 +1,7 @@
+strata-context-manager
+Copyright 2026 themimi974
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It works with, but does not include, Strata (https://github.com/Niko1221/Strata), LiteLLM
+(https://github.com/BerriAI/litellm) and Hermes Agent (https://github.com/nousresearch/hermes-agent).
+The strata-context-manager-litellm image is built on the LiteLLM image, under LiteLLM's license.

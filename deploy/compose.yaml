@@ -1,0 +1,89 @@
+# strata-context-manager: LiteLLM (with the hook) + PostgreSQL + Context Manager.
+# Strata runs elsewhere (a GPU machine): set STRATA_URL in .env.
+#   cp .env.example .env && edit it
+#   docker compose up -d
+# Clients then use http://<this host>:4000/v1 with model "${MODEL_NAME}" and a LiteLLM key.
+name: strata-context-manager
+
+services:
+  litellm:
+    image: ${LITELLM_IMAGE:-dockerfan4life/strata-context-manager-litellm:0.1.0}
+    build:
+      context: ..
+      dockerfile: docker/litellm/Dockerfile
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "${LITELLM_BIND:-}${LITELLM_PORT:-4000}:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set LITELLM_SALT_KEY in .env}
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+      LITELLM_MODE: PRODUCTION
+      LITELLM_LOG: ERROR
+      STRATA_API_BASE: ${STRATA_URL:?set STRATA_URL in .env}/v1
+      STRATA_MODEL: ${STRATA_MODEL:?set STRATA_MODEL in .env}
+      CONTEXT_MANAGER_URL: http://context-manager:8090
+    depends_on:
+      db:
+        condition: service_healthy
+      context-manager:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  context-manager:
+    image: ${CONTEXT_MANAGER_IMAGE:-dockerfan4life/strata-context-manager:0.1.0}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CTX_DATABASE_URL: postgresql://context:${CTX_DB_PASSWORD:?set CTX_DB_PASSWORD in .env}@db:5432/context
+      CTX_ENGINE_URL: ${STRATA_URL}
+      CTX_MODE: ${CTX_MODE:-snapshot}
+      CTX_REORDER: ${CTX_REORDER:-1}
+      CTX_VOLATILE_PATTERNS: ${CTX_VOLATILE_PATTERNS:-}
+      CTX_PIN_SYSTEM: ${CTX_PIN_SYSTEM:-0}
+      CTX_ADMIN_TOKEN: ${CTX_ADMIN_TOKEN:?set CTX_ADMIN_TOKEN in .env}
+      CTX_MODEL_ID: ${MODEL_NAME:-qwen3.8-flash-next}
+      CTX_QUANT: ${CTX_QUANT:-unknown}
+      CTX_WEIGHTS_HASH: ${CTX_WEIGHTS_HASH:-unknown}
+      CTX_ENGINE_VERSION: ${CTX_ENGINE_VERSION:-unknown}
+      CTX_TEMPLATE_VERSION: ${CTX_TEMPLATE_VERSION:-unknown}
+      CTX_PREFILL_TOK_PER_S: ${CTX_PREFILL_TOK_PER_S:-500}
+      CTX_RECORD: ${CTX_RECORD:-}             # benchmark: e.g. /bench/requests.jsonl (mount a folder below)
+    # volumes:
+    #   - ./bench-data:/bench
+    ports:
+      - "${CONTEXT_MANAGER_BIND:-}${CONTEXT_MANAGER_PORT:-8090}:8090"   # the engine-side janitor calls it
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: litellm
+      CTX_DB_PASSWORD: ${CTX_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-context-db.sh:/docker-entrypoint-initdb.d/10-context-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm && psql -U litellm -d context -c 'select 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgres_data:

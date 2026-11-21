@@ -1,0 +1,13 @@
+[Unit]
+Description=Strata server watchdog
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/strata-watchdog
+Restart=always
+RestartSec=10
+# stopping the watchdog leaves the Strata server running
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
