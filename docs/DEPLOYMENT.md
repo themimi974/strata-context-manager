@@ -33,7 +33,8 @@ Edit `.env`: `STRATA_URL`, `STRATA_MODEL`, and the secrets (`openssl rand -hex 2
 must start with `sk-`). Fill in the validity tuple if you can ([CONFIGURATION.md](CONFIGURATION.md)). Then:
 
 ```bash
-docker compose up -d          # pulls the published images; add --build to build them from this checkout
+docker compose up -d          # pulls the published images from Docker Hub
+# or: docker compose up -d --build   to build them from this checkout
 docker compose ps             # three services, healthy after ~1 min
 curl -s localhost:8090/health
 ```
@@ -43,12 +44,17 @@ If your model name differs from `qwen3.8-flash-next`, change `model_name` in `de
 
 ### Create a key for each client
 
+From the `deploy/` folder (the master key is read from `.env`):
+
 ```bash
-curl -s http://localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+M=$(grep -oP '^LITELLM_MASTER_KEY=\K\S+' .env)
+curl -s http://localhost:4000/key/generate -H "Authorization: Bearer $M" \
   -H "Content-Type: application/json" -d '{"key_alias":"hermes-agent","models":["qwen3.8-flash-next"]}'
 ```
 
-or in LiteLLM's web UI at `http://<gateway>:4000/ui` → Virtual Keys.
+The answer contains `"key": "sk-..."`. LiteLLM stores keys hashed: copy it now, it cannot be shown again.
+
+You can also create keys in LiteLLM's web UI at `http://<gateway>:4000/ui` → Virtual Keys.
 
 ### Already running LiteLLM?
 
@@ -75,7 +81,9 @@ model:
   context_length: 131072          # = Strata --max-context
 ```
 
-or run `hermes model` and choose *custom*. Keep context compression at a high threshold (Hermes' `threshold: 0.85`):
+The easiest way is `hermes model` (choose *custom*), which writes these values for you. If you edit the file by
+hand, note that Hermes may keep the active `api_key:` line far below the rest of the `model:` section, after
+comment blocks: search for the line that is not commented out. Keep context compression at a high threshold (Hermes' `threshold: 0.85`):
 each compaction makes everything after the system prompt new text.
 
 ### Other agents

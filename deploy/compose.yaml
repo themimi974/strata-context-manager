@@ -7,7 +7,7 @@ name: strata-context-manager
 
 services:
   litellm:
-    image: ${LITELLM_IMAGE:-dockerfan4life/strata-context-manager-litellm:0.1.0}
+    image: ${LITELLM_IMAGE:-dockerfan4life/strata-context-manager-litellm:0.1.1}
     build:
       context: ..
       dockerfile: docker/litellm/Dockerfile
@@ -40,7 +40,7 @@ services:
       start_period: 60s
 
   context-manager:
-    image: ${CONTEXT_MANAGER_IMAGE:-dockerfan4life/strata-context-manager:0.1.0}
+    image: ${CONTEXT_MANAGER_IMAGE:-dockerfan4life/strata-context-manager:0.1.1}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -59,6 +59,9 @@ services:
       CTX_ENGINE_VERSION: ${CTX_ENGINE_VERSION:-unknown}
       CTX_TEMPLATE_VERSION: ${CTX_TEMPLATE_VERSION:-unknown}
       CTX_PREFILL_TOK_PER_S: ${CTX_PREFILL_TOK_PER_S:-500}
+      CTX_SAVE_MIN_TOKENS: ${CTX_SAVE_MIN_TOKENS:-8192}
+      CTX_SAVE_STEP_TOKENS: ${CTX_SAVE_STEP_TOKENS:-8192}
+      CTX_RESTORE_MIN_GAIN: ${CTX_RESTORE_MIN_GAIN:-2048}
       CTX_RECORD: ${CTX_RECORD:-}             # benchmark: e.g. /bench/requests.jsonl (mount a folder below)
     # volumes:
     #   - ./bench-data:/bench

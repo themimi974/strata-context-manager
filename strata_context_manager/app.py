@@ -276,21 +276,24 @@ class Evicted(BaseModel):
 
 @app.get("/v1/snapshots/eviction-order")
 async def eviction_order(x_ctx_token: str | None = Header(default=None)):
-    """Snapshot files, lowest value first (P(reuse) x recompute cost / size); pinned ones are left out."""
+    """Snapshot files, lowest value first (P(reuse) x recompute cost / size). Pinned ones are not in `order` but are
+    listed in `keep`, so the janitor can tell known files from orphans (files no snapshot row points to)."""
     if not _authorized(x_ctx_token):
         raise HTTPException(status_code=403, detail="bad token")
     async with pool.acquire() as c:
         rows = await c.fetch("""SELECT location, size_bytes, hits, pinned, stale, recompute_ms,
                                        extract(epoch FROM now() - coalesce(last_used, created_at)) / 3600 AS age_h
                                 FROM kv_snapshot""")
-    order = []
+    order, keep = [], []
     for r in rows:
         v = 0.0 if r["stale"] else policy.snapshot_value(r["hits"], float(r["age_h"] or 0), r["recompute_ms"] or 0,
                                                          r["size_bytes"] or 1, r["pinned"])
         if v != float("inf"):
             order.append({"location": r["location"], "size_bytes": r["size_bytes"], "value": v})
+        else:
+            keep.append(r["location"])
     order.sort(key=lambda x: x["value"])
-    return {"order": order}
+    return {"order": order, "keep": keep}
 
 
 @app.post("/v1/snapshots/evicted")

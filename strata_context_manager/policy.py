@@ -1,9 +1,11 @@
 """Snapshot decisions, kept pure so they can be tested without an engine or a database."""
 from __future__ import annotations
 
-SAVE_MIN_TOKENS = 8192      # do not snapshot short conversations: re-reading them is cheap
-SAVE_STEP_TOKENS = 8192     # save again once the conversation grew this much past its last snapshot
-RESTORE_MIN_GAIN = 2048     # restore only when it saves at least this many tokens of reading
+import os
+
+SAVE_MIN_TOKENS = int(os.environ.get("CTX_SAVE_MIN_TOKENS", "8192"))    # shorter conversations are cheap to re-read
+SAVE_STEP_TOKENS = int(os.environ.get("CTX_SAVE_STEP_TOKENS", "8192"))  # save again after this much growth
+RESTORE_MIN_GAIN = int(os.environ.get("CTX_RESTORE_MIN_GAIN", "2048"))  # restore only if it saves this much reading
 
 
 def lcp(a: list[str], b: list[str]) -> int:

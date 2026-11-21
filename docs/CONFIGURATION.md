@@ -19,8 +19,16 @@ All settings are environment variables. With the compose deployment they come fr
 | `CTX_PREFILL_TOK_PER_S` | `500` | your engine's cold prompt speed; used to value snapshots (recompute cost) |
 | `CTX_RECORD` | empty | benchmark only: append every observed request to this JSONL file |
 
-Snapshot thresholds (in `strata_context_manager/policy.py`): save from 8,192 prompt tokens and every 8,192 tokens of
-growth; restore only when it saves at least 2,048 tokens.
+Snapshot thresholds:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CTX_SAVE_MIN_TOKENS` | `8192` | save a conversation only from this prompt size |
+| `CTX_SAVE_STEP_TOKENS` | `8192` | save again once it grew this much since its last snapshot |
+| `CTX_RESTORE_MIN_GAIN` | `2048` | restore only when it saves at least this many tokens of reading |
+
+Smaller steps mean fresher snapshots after a restart (less to re-read) at the cost of more disk writes: a session that
+ends between two steps is restored from its previous snapshot and the rest is read again.
 
 ### Validity tuple
 
@@ -57,7 +65,7 @@ Enable it in the LiteLLM config with `litellm_settings: callbacks: strata_contex
 | `MODEL_NAME` | the name clients ask for; keep it equal to `model_name` in `deploy/litellm-config.yaml` |
 | `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` | LiteLLM secrets (the master key must start with `sk-`; never change the salt key after first start) |
 | `POSTGRES_PASSWORD`, `CTX_DB_PASSWORD` | database passwords (LiteLLM's and the Context Manager's) |
-| `LITELLM_IMAGE`, `CONTEXT_MANAGER_IMAGE` | override the images (defaults: the published `0.1.0` tags) |
+| `LITELLM_IMAGE`, `CONTEXT_MANAGER_IMAGE` | override the images (defaults: the published `0.1.1` tags) |
 | `LITELLM_BIND`, `LITELLM_PORT`, `CONTEXT_MANAGER_BIND`, `CONTEXT_MANAGER_PORT` | published ports; e.g. `LITELLM_BIND=127.0.0.1:` |
 
 ## Engine side (`/etc/default/strata-watchdog`, `/etc/default/strata-context`)

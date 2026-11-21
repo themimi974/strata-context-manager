@@ -5,7 +5,7 @@ Optional, but used in the reference setup. Run as root.
 | File | What it does |
 |---|---|
 | `strata-watchdog.sh` + `strata-watchdog.service` | keeps the Strata server alive; after a GPU reset it stops everything, drops the page cache and starts fresh ([WATCHDOG.md](WATCHDOG.md)) |
-| `strata-slots-janitor.sh` | keeps the snapshot folder under a size budget, deleting the lowest-value snapshots first |
+| `strata-slots-janitor.sh` | deletes orphaned snapshot files (no record points to them, e.g. after a database reset), and keeps the folder under a size budget, lowest-value snapshots first |
 | `strata-restart.sh` | clean stop + start of Strata through the watchdog, waits until the model is loaded |
 
 ## Snapshot folder
