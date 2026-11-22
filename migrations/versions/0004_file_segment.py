@@ -13,7 +13,7 @@ depends_on = None
 def upgrade():
     op.execute("""
 CREATE TABLE file_segment (
-    seg_id      text PRIMARY KEY,                 -- sha256(validity root | exact tool-result text)[:32]
+    seg_id      text PRIMARY KEY,                 -- first 32 hex chars of sha256(validity root | exact tool-result text)
     tool        text,
     chars       integer,
     first_seen  timestamptz NOT NULL DEFAULT now(),
