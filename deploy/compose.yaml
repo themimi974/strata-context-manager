@@ -7,7 +7,7 @@ name: strata-context-manager
 
 services:
   litellm:
-    image: ${LITELLM_IMAGE:-dockerfan4life/strata-context-manager-litellm:0.2.0}
+    image: ${LITELLM_IMAGE:-dockerfan4life/strata-context-manager-litellm:0.1.1}
     build:
       context: ..
       dockerfile: docker/litellm/Dockerfile
@@ -40,7 +40,7 @@ services:
       start_period: 60s
 
   context-manager:
-    image: ${CONTEXT_MANAGER_IMAGE:-dockerfan4life/strata-context-manager:0.2.0}
+    image: ${CONTEXT_MANAGER_IMAGE:-dockerfan4life/strata-context-manager:0.1.1}
     build:
       context: ..
       dockerfile: Dockerfile
