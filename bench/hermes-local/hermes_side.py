@@ -39,8 +39,18 @@ out = {
     "reasoning_tokens": sum(s["reasoning_tokens"] or 0 for s in sess),
 }
 
-msgs = c.execute(f"select * from messages where session_id in ({q}) order by id", ids).fetchall()
+rows = c.execute(f"select * from messages where session_id in ({q}) order by id", ids).fetchall()
+# Hermes' store can hold a message twice (a block of early rows is written again later): keep the first, order by time
+seen, msgs = set(), []
+for m in rows:
+    k = (m["timestamp"], m["role"], m["tool_call_id"])
+    if k not in seen:
+        seen.add(k)
+        msgs.append(m)
+msgs.sort(key=lambda m: (m["timestamp"] or 0, m["id"]))
 out["messages"] = len(msgs)
+out["rows_in_store"] = len(rows)
+out["hermes_counters"] = {"messages": sum(s["message_count"] or 0 for s in sess), "tool_calls": sum(s["tool_call_count"] or 0 for s in sess)}
 out["finish_reasons"] = dict(collections.Counter(m["finish_reason"] for m in msgs if m["role"] == "assistant"))
 
 calls, sig_of_call, results = [], {}, {}

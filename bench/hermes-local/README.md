@@ -25,5 +25,7 @@ python3 collect.py "first words of the task prompt" <strata log line>    # one s
 The task's session is found by the first words of its prompt; sessions created by a compaction are followed.
 `CT_HERMES`, `CT_GATEWAY` and `STRATA_LOG` override the defaults.
 
+`readstyle.py RECORDING.jsonl` classifies how the agent reads files (whole-file `cat`, partial `sed -n`/`head`, `read_file`, searches), to see whether the file cache can apply.
+
 Alerts: a call repeated 8 times in a row, a failing call repeated 4 times, changes in paths the task must not touch
 (edit the list in `sampler.sh`), no change at all after an hour.
