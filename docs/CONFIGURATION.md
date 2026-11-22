@@ -73,7 +73,7 @@ File state cache (research, needs the Strata build with `strata_segx`; see [FILE
 | `MODEL_NAME` | the name clients ask for; keep it equal to `model_name` in `deploy/litellm-config.yaml` |
 | `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` | LiteLLM secrets (the master key must start with `sk-`; never change the salt key after first start) |
 | `POSTGRES_PASSWORD`, `CTX_DB_PASSWORD` | database passwords (LiteLLM's and the Context Manager's) |
-| `LITELLM_IMAGE`, `CONTEXT_MANAGER_IMAGE` | override the images (defaults: the published `0.1.1` tags; build from this repo for the file cache) |
+| `LITELLM_IMAGE`, `CONTEXT_MANAGER_IMAGE` | override the images (defaults: the published `0.2.0` tags) |
 | `LITELLM_BIND`, `LITELLM_PORT`, `CONTEXT_MANAGER_BIND`, `CONTEXT_MANAGER_PORT` | published ports; e.g. `LITELLM_BIND=127.0.0.1:` |
 
 ## Engine side (`/etc/default/strata-watchdog`, `/etc/default/strata-context`)

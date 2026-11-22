@@ -52,11 +52,56 @@ flowchart LR
 * **Context Manager** (FastAPI + Postgres): cuts each request into content-hashed blocks, recognises conversations it
   has seen, restores the deepest matching snapshot when Strata has lost the conversation, and saves new snapshots of
   long conversations.
-* **Strata**: does the work. Snapshots use Strata's slot save/restore (`--slot-save-path`); no Strata patch is needed.
+* **Strata**: does the work. Snapshots use Strata's slot save/restore (`--slot-save-path`); no Strata patch is needed (only the optional file cache below uses a Strata fork).
 * **Engine-side tools** (optional): a watchdog that restarts Strata cleanly after a GPU reset, and a janitor that keeps
   the snapshot folder under a size budget.
 
 Details: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
+## File state cache (optional, research)
+
+**Why.** The snapshots above help when the agent comes back to a conversation the engine forgot. They do not help
+when the agent reads the same file in a new session, or again after a compaction: the conversation is different, so
+there is no snapshot to restore, and the file is read from scratch. On a home GPU a 9K-token source file takes about
+9–14 s to read each time; agents working on one project read the same files over and over.
+
+**How.** The first time the agent reads a file (a `read_file` tool result), Strata stores the state the model built
+while reading it. The next time the same file appears in any conversation, Strata loads that state at the new place in
+the prompt instead of reading the file. Strata's model mixes two kinds of layers, and both are handled:
+
+* attention layers: the file's stored keys and values are copied in and their positions corrected;
+* DeltaNet layers (a running memory): the file's effect on that memory is stored as a matrix and applied to whatever
+  the memory holds at the new place.
+
+The file's first 15 % and last few tokens are read normally to stitch it to its new surroundings. If the stored copy
+does not match the file token for token, the file is simply read; a request never fails because of the cache.
+
+This needs a modified Strata: the fork [themimi974/Strata](https://github.com/themimi974/Strata), branch
+[`file-state-cache`](https://github.com/themimi974/Strata/tree/file-state-cache). Switch it on with `CTX_SEG=1`.
+
+| Re-reading a 23K-character file in a new Hermes session (live, 22 Nov 2026) | Normal read | From the cache |
+|---|---:|---:|
+| Prompt reading for that step | 14.1 s | **4.1 s** |
+| Whole session | 23 s | **12 s** |
+
+**Precision: read this before switching it on.** A loaded file is close to, but not exactly, what a normal read
+gives. On 192 questions with known answers (quote a line exactly, find a line number, write a rename as a diff), each
+asked after a normal read, a second normal read (to measure the engine's own noise) and a cache load:
+
+| | Normal | Normal again | Cache |
+|---|---:|---:|---:|
+| All questions | 60.4 % | 59.9 % | 57.8 % |
+| One file, short conversation | 65.5 % | 67.9 % | 65.5 % |
+| Long conversation, several files, after a compaction | 56.5 % | 53.7 % | 51.9 % |
+
+* Overall: −2.6 ± 4.4 points, within the noise for single files, larger in long multi-file sessions.
+* Losses are mostly on quoting lines word for word; finding lines and writing diffs barely move.
+* Measured only on Qwen3.8-Flash-Next IQ2_XS (2-bit) on one AMD MI100; another model or quantisation may behave
+  differently. Code questions only, not whole agent tasks.
+* Each stored file takes ~70 MB + ~18 KB per token on disk (~210 MB for an 8K-token file); storing it adds ~25 % to
+  its first read.
+
+Off by default. Details, method and install: [docs/FILE-CACHE.md](docs/FILE-CACHE.md).
 
 ## Requirements
 
@@ -93,8 +138,6 @@ context size (131072). Hermes example and the other clients: [docs/DEPLOYMENT.md
 * After a context compaction (`/compact`), everything after the system prompt is new text and is read once.
 
 Downsides and known issues: [docs/LIMITS.md](docs/LIMITS.md) · [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)
-
-File state cache (research, off by default): [docs/FILE-CACHE.md](docs/FILE-CACHE.md).
 
 ## Repository
 
