@@ -27,5 +27,7 @@ The task's session is found by the first words of its prompt; sessions created b
 
 `readstyle.py RECORDING.jsonl` classifies how the agent reads files (whole-file `cat`, partial `sed -n`/`head`, `read_file`, searches), to see whether the file cache can apply.
 
+`partial_reads.py RECORDING.jsonl` studies every file read (`sed -n`, `head`, `tail`, `cat`, `read_file`): how much is new, repeated inside the same context, or re-read after being dropped, and how many minutes of wall clock the reading turns take. It reads file lengths from the Hermes container (`pct exec 104 -- wc -l`): adapt that line to your setup.
+
 Alerts: a call repeated 8 times in a row, a failing call repeated 4 times, changes in paths the task must not touch
 (edit the list in `sampler.sh`), no change at all after an hour.
