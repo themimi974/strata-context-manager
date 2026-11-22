@@ -1,0 +1,31 @@
+From e1b6b90726cdd588e5aeab719be56132ba7f0e2c Mon Sep 17 00:00:00 2001
+From: Strata lab <lab@localhost>
+Date: Sun, 22 Nov 2026 12:47:13 +0000
+Subject: [PATCH] F3.4 fix: segx looks for stored files under the v2- path
+
+The segx stored check still used <store>/<id>, so a file with an old-format image was declared stored,
+compose found no v2 image and fell back to a normal read without capturing. Checked live with Hermes:
+capture, then compose (GPU 8 ms, prompt reading 14.1 -> 4.1 s).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LHC9HuRHHgU5cu8SqUTYdk
+---
+ engine/src/program/generate.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index f63974618..c7878bca9 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -20359,7 +20359,7 @@ int main(int argc, char** argv) {
+                 for (const SegReq& r : autos) {
+                     if (r.id.empty()) continue;
+                     bool stored = false;
+-                    std::FILE* tf = std::fopen((std::string(base ? base : "/nvme/strata-segments") + "/" + r.id + "/ids.i32").c_str(), "rb");
++                    std::FILE* tf = std::fopen((std::string(base ? base : "/nvme/strata-segments") + "/v2-" + r.id + "/ids.i32").c_str(), "rb");
+                     if (tf != nullptr) {
+                         std::vector<int32_t> st((size_t) (r.e - r.a));
+                         stored = std::fread(st.data(), 4, st.size(), tf) == st.size() && std::fgetc(tf) == EOF;
+-- 
+2.43.0
+

@@ -1,0 +1,292 @@
+From 1b994f77a15946d6a45e2ec6907db7e74baf8d28 Mon Sep 17 00:00:00 2001
+From: Strata lab <lab@localhost>
+Date: Sun, 22 Nov 2026 12:18:31 +0000
+Subject: [PATCH 5/5] F3.4/F3.5: compact file state images, last-use touch
+
+GDN image: S0 = W_after - T W_before (bf16) + T only for heads whose operator is not ~0 (bf16, per-head mask)
++ conv rows; replaces before/after/T fp32 (470 MB -> 211 MB for a 7.7K-token file, T 226 -> 14 MB).
+Store path v2-<id> (old images are not read). A successful compose touches the directory mtime so the
+segments janitor deletes the least recently used first.
+Checked: 12/12 answers identical to a normal read (F3.2 test); drift at 4 load alignments unchanged
+(KL 0.047/0.029/0.023/0.042 vs 0.049/0.037/0.019/0.045); compose GPU 8 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LHC9HuRHHgU5cu8SqUTYdk
+---
+ engine/include/strata/prefill/segcap.hpp |   6 +
+ engine/src/prefill/segcap.cpp            |   7 ++
+ engine/src/prefill/segcompose.cu         | 135 ++++++++++++++++++++---
+ engine/src/program/generate.cpp          |  12 +-
+ 4 files changed, 140 insertions(+), 20 deletions(-)
+
+diff --git a/engine/include/strata/prefill/segcap.hpp b/engine/include/strata/prefill/segcap.hpp
+index 207d87863..e9f33c923 100644
+--- a/engine/include/strata/prefill/segcap.hpp
++++ b/engine/include/strata/prefill/segcap.hpp
+@@ -29,6 +29,7 @@ struct SegCap {
+     int64_t raw_cap = 0;        ///< floats allocated in `raw`
+     float* raw = nullptr;       ///< (n_qsa, span_n, 128) fp32: never normed, never rotated (qsa.hpp)
+     int64_t raw_rows = 0;       ///< rows written (n_qsa x span_n expected)
++    std::vector<float> before;  ///< F3.4: the GDN state before the span (host), for S0 = W_after - T W_before
+ };
+ 
+ SegCap& segcap();
+@@ -45,6 +46,11 @@ const float* segcap_knorm(int64_t qsa_ord);
+ void segcap_layer(int64_t gdn_ord, const float* h, const float* gate, const float* beta, int64_t T, void* stream);
+ /// Synchronizes, writes T (n_gdn x layer floats) to `path`, turns the capture off.
+ bool segcap_end(const std::string& path, std::string& err);
++/// F3.4: keeps the GDN state before the span on the host (replaces the before.f32 dump).
++bool segcap_snapshot_before(const float* dev, uint64_t floats, std::string& err);
++/// F3.4: ends the capture and writes the compact GDN image to `dir`: T.bf16 (per-head mask, bf16, only the heads
++/// whose operator is not ~0), S0.bf16 (W_after - T W_before, bf16) and conv.f32 (the conv rows after the span).
++bool segcap_finish(const std::string& dir, const float* gdn_after, int64_t n_gdn, std::string& err);
+ /// Synchronizes and writes `floats` floats of device memory to `path` (the GDN state before / after the span).
+ bool segcap_dump(const float* dev, uint64_t floats, const std::string& path, std::string& err);
+ 
+diff --git a/engine/src/prefill/segcap.cpp b/engine/src/prefill/segcap.cpp
+index 0a4584173..389adc284 100644
+--- a/engine/src/prefill/segcap.cpp
++++ b/engine/src/prefill/segcap.cpp
+@@ -138,6 +138,13 @@ bool segcap_end(const std::string& path, std::string& err) {
+     return write_file(path, host, err);
+ }
+ 
++bool segcap_snapshot_before(const float* dev, uint64_t floats, std::string& err) {
++    if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
++    std::vector<float>& h = segcap().before;
++    h.resize((size_t) floats);
++    return ok(cudaMemcpy(h.data(), dev, h.size() * sizeof(float), cudaMemcpyDeviceToHost), "before D2H", err);
++}
++
+ bool segcap_dump(const float* dev, uint64_t floats, const std::string& path, std::string& err) {
+     if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
+     std::vector<float> host((size_t) floats);
+diff --git a/engine/src/prefill/segcompose.cu b/engine/src/prefill/segcompose.cu
+index c0a2f70e7..b6a844524 100644
+--- a/engine/src/prefill/segcompose.cu
++++ b/engine/src/prefill/segcompose.cu
+@@ -14,6 +14,7 @@
+ #include <cuda_runtime.h>
+ #include <cuda_fp16.h>
+ #include <cmath>
++#include <cstring>
+ #include <exception>
+ #include <cstdio>
+ #include <vector>
+@@ -159,6 +160,38 @@ bool write_file(const std::string& path, const void* p, size_t n, std::string& e
+     return w;
+ }
+ 
++// F3.4: W_new = S0 + T W per layer and v-head, T only for the heads in `mask` (the others carry nothing over).
++__global__ void gdn_apply(const float* T, const uint8_t* mask, const float* S0, const float* W, float* out, int64_t L,
++                          uint64_t stride, int use_t) {
++    const uint64_t idx = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= (uint64_t) L * NST) return;
++    const uint64_t l = idx / NST, e = idx % NST;
++    const uint64_t i = e / (HV * S), h = (e / S) % HV, j = e % S;
++    double acc = S0[l * NST + e];
++    if (use_t && mask[l * HV + h]) {
++        const float* Tl = T + l * NST;
++        const float* Wl = W + l * stride;
++        for (uint64_t m = 0; m < (uint64_t) S; ++m) acc += (double) Tl[(i * HV + h) * S + m] * Wl[(m * HV + h) * S + j];
++    }
++    out[l * NST + e] = (float) acc;
++}
++
++uint16_t f2bf(float f) {
++    uint32_t u;
++    std::memcpy(&u, &f, 4);
++    u += 0x7FFFu + ((u >> 16) & 1u);
++    return (uint16_t) (u >> 16);
++}
++
++float bf2f(uint16_t b) {
++    const uint32_t u = (uint32_t) b << 16;
++    float f;
++    std::memcpy(&f, &u, 4);
++    return f;
++}
++
++constexpr float T_HEAD_EPS = 1e-5f;   // a head whose operator never exceeds this carries nothing over: not stored
++
+ template <class X>
+ bool to_dev(const std::vector<char>& h, X** d, std::string& err) {
+     if (!ok(cudaMalloc((void**) d, h.size()), "malloc", err)) return false;
+@@ -166,6 +199,57 @@ bool to_dev(const std::vector<char>& h, X** d, std::string& err) {
+ }
+ }  // namespace
+ 
++bool segcap_finish(const std::string& dir, const float* gdn_after, int64_t n_gdn, std::string& err) {
++    SegCap& s = segcap();
++    s.active = false;
++    if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
++    if (s.overflow) { err = "segcap: a chunk was larger than the scratch: capture invalid"; return false; }
++    const uint64_t stride = NST + CONV;
++    if (s.before.size() != (size_t) n_gdn * stride || s.T == nullptr) { err = "segcap: no state before the span"; return false; }
++    float *dWb = nullptr, *dS0 = nullptr;
++    if (!ok(cudaMalloc(&dWb, s.before.size() * 4), "malloc", err) || !ok(cudaMalloc(&dS0, (size_t) n_gdn * NST * 4), "malloc", err)) {
++        if (dWb) cudaFree(dWb);
++        return false;
++    }
++    cudaMemcpy(dWb, s.before.data(), s.before.size() * 4, cudaMemcpyHostToDevice);
++    const uint64_t tot = (uint64_t) n_gdn * NST;   // S0 = W_after - T W_before (the existing kernel, no current state)
++    gdn_compose<<<(unsigned) ((tot + 255) / 256), 256>>>(s.T, dWb, gdn_after, dWb, dS0, n_gdn, stride, 0);
++    std::vector<float> hT(tot), hS0(tot), conv((size_t) n_gdn * CONV);
++    bool good = ok(cudaDeviceSynchronize(), "S0", err) &&
++                ok(cudaMemcpy(hT.data(), s.T, tot * 4, cudaMemcpyDeviceToHost), "T D2H", err) &&
++                ok(cudaMemcpy(hS0.data(), dS0, tot * 4, cudaMemcpyDeviceToHost), "S0 D2H", err);
++    for (int64_t l = 0; good && l < n_gdn; ++l)
++        good = ok(cudaMemcpy(conv.data() + (size_t) l * CONV, gdn_after + l * stride + NST, CONV * 4, cudaMemcpyDeviceToHost),
++                  "conv D2H", err);
++    cudaFree(dWb);
++    cudaFree(dS0);
++    if (!good) return false;
++    // T.bf16: "SEGT1", n_gdn, the per-head mask, then the kept heads' 128x128 operators ([i][j]) in bf16
++    std::vector<uint8_t> mask((size_t) n_gdn * HV, 0);
++    std::vector<uint16_t> tb;
++    for (int64_t l = 0; l < n_gdn; ++l)
++        for (int64_t h = 0; h < HV; ++h) {
++            float mx = 0.0f;
++            for (int64_t i = 0; i < S; ++i)
++                for (int64_t j = 0; j < S; ++j) mx = std::fmax(mx, std::fabs(hT[(size_t) l * NST + (i * HV + h) * S + j]));
++            if (mx <= T_HEAD_EPS) continue;
++            mask[(size_t) l * HV + h] = 1;
++            for (int64_t i = 0; i < S; ++i)
++                for (int64_t j = 0; j < S; ++j) tb.push_back(f2bf(hT[(size_t) l * NST + (i * HV + h) * S + j]));
++        }
++    std::vector<char> tfile(8 + mask.size() + tb.size() * 2);
++    std::memcpy(tfile.data(), "SEGT1\0\0\0", 8);
++    std::memcpy(tfile.data() + 8, mask.data(), mask.size());
++    std::memcpy(tfile.data() + 8 + mask.size(), tb.data(), tb.size() * 2);
++    std::vector<uint16_t> sb(tot);
++    for (size_t k = 0; k < tot; ++k) sb[k] = f2bf(hS0[k]);
++    s.before.clear();
++    s.before.shrink_to_fit();
++    return write_file(dir + "/T.bf16", tfile.data(), tfile.size(), err) &&
++           write_file(dir + "/S0.bf16", sb.data(), sb.size() * 2, err) &&
++           write_file(dir + "/conv.f32", conv.data(), conv.size() * 4, err);
++}
++
+ bool segcap_save_qsa(const std::vector<SegQsa>& layers, int page_size, int64_t a, int64_t e, const float* ple_hist,
+                      uint64_t ple_floats, const std::string& dir, std::string& err) {
+     if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
+@@ -238,27 +322,50 @@ bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_stat
+             err = "segcompose: indexer k_norm weights not registered yet (no prompt read since the engine started)";
+             return false;
+         }
+-    std::vector<char> hT, hB, hA, hQ, hP;
+-    if (!read_file(dir + "/T.f32", hT, err) || !read_file(dir + "/before.f32", hB, err) ||
+-        !read_file(dir + "/after.f32", hA, err) || !read_file(dir + "/qsa.bin", hQ, err) || !read_file(dir + "/ple.f32", hP, err))
++    std::vector<char> hTf, hSf, hC, hQ, hP;
++    if (!read_file(dir + "/T.bf16", hTf, err) || !read_file(dir + "/S0.bf16", hSf, err) || !read_file(dir + "/conv.f32", hC, err) ||
++        !read_file(dir + "/qsa.bin", hQ, err) || !read_file(dir + "/ple.f32", hP, err))
+         return false;
+-    const uint64_t stride = NST + CONV;
+-    if (hT.size() != (size_t) n_gdn * NST * 4 || hB.size() != (size_t) n_gdn * stride * 4 || hA.size() != hB.size()) {
+-        err = "segcompose: GDN file sizes";
++    const uint64_t stride = NST + CONV, tot = (uint64_t) n_gdn * NST;
++    const size_t nmask = (size_t) n_gdn * HV;
++    if (hTf.size() < 8 + nmask || std::memcmp(hTf.data(), "SEGT1", 5) != 0 || hSf.size() != tot * 2 ||
++        hC.size() != (size_t) n_gdn * CONV * 4) {
++        err = "segcompose: GDN image sizes";
+         return false;
+     }
+-    float *dT, *dB, *dA, *dOut;
++    std::vector<uint8_t> mask(nmask);
++    std::memcpy(mask.data(), hTf.data() + 8, nmask);
++    size_t kept = 0;
++    for (uint8_t m : mask) kept += m;
++    if (hTf.size() != 8 + nmask + kept * S * S * 2) { err = "segcompose: T image size"; return false; }
++    std::vector<float> fT(tot, 0.0f), fS(tot);
++    {
++        const uint16_t* tb = (const uint16_t*) (hTf.data() + 8 + nmask);
++        size_t k = 0;
++        for (int64_t l = 0; l < n_gdn; ++l)
++            for (int64_t h = 0; h < HV; ++h) {
++                if (!mask[(size_t) l * HV + h]) continue;
++                for (int64_t i = 0; i < S; ++i)
++                    for (int64_t j = 0; j < S; ++j) fT[(size_t) l * NST + (i * HV + h) * S + j] = bf2f(tb[k++]);
++            }
++        const uint16_t* sb = (const uint16_t*) hSf.data();
++        for (size_t q = 0; q < tot; ++q) fS[q] = bf2f(sb[q]);
++    }
++    float *dT, *dS, *dOut;
++    uint8_t* dM;
+     char* dQ;
+-    if (!to_dev(hT, &dT, err) || !to_dev(hB, &dB, err) || !to_dev(hA, &dA, err) || !to_dev(hQ, &dQ, err) ||
+-        !ok(cudaMalloc(&dOut, (size_t) n_gdn * NST * 4), "malloc", err))
++    if (!ok(cudaMalloc(&dT, tot * 4), "malloc", err) || !ok(cudaMalloc(&dS, tot * 4), "malloc", err) ||
++        !ok(cudaMalloc(&dM, nmask), "malloc", err) || !ok(cudaMalloc(&dOut, tot * 4), "malloc", err) || !to_dev(hQ, &dQ, err))
+         return false;
++    cudaMemcpy(dT, fT.data(), tot * 4, cudaMemcpyHostToDevice);
++    cudaMemcpy(dS, fS.data(), tot * 4, cudaMemcpyHostToDevice);
++    cudaMemcpy(dM, mask.data(), nmask, cudaMemcpyHostToDevice);
+     cudaEventRecord(t0);
+-    // 1. GDN recurrent state + conv rows
+-    const uint64_t tot = (uint64_t) n_gdn * NST;
+-    gdn_compose<<<(unsigned) ((tot + 255) / 256), 256>>>(dT, dB, dA, gdn_state, dOut, n_gdn, stride, use_t ? 1 : 0);
++    // 1. GDN recurrent state (S0 + T W) and the conv rows after the span
++    gdn_apply<<<(unsigned) ((tot + 255) / 256), 256>>>(dT, dM, dS, gdn_state, dOut, n_gdn, stride, use_t ? 1 : 0);
+     for (int64_t l = 0; l < n_gdn; ++l) {
+         cudaMemcpy(gdn_state + l * stride, dOut + l * NST, NST * 4, cudaMemcpyDeviceToDevice);
+-        cudaMemcpy(gdn_state + l * stride + NST, dA + l * stride + NST, CONV * 4, cudaMemcpyDeviceToDevice);
++        cudaMemcpy(gdn_state + l * stride + NST, hC.data() + (size_t) l * CONV * 4, CONV * 4, cudaMemcpyHostToDevice);
+     }
+     // 2. QSA layers: K/V cells (keys re-rotated by D), then the raw indexer keys appended at [a, e)
+     const size_t codes = (size_t) n * NKV * HD, scales = (size_t) n * NKV * NG, raw = (size_t) n * IDX * 4;
+@@ -297,7 +404,7 @@ bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_stat
+     float f = 0;
+     cudaEventElapsedTime(&f, t0, t1);
+     if (ms) *ms = f;
+-    cudaFree(dT); cudaFree(dB); cudaFree(dA); cudaFree(dOut); cudaFree(dQ);
++    cudaFree(dT); cudaFree(dS); cudaFree(dM); cudaFree(dOut); cudaFree(dQ);
+     cudaEventDestroy(t0);
+     cudaEventDestroy(t1);
+     return good;
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index ae1c33f28..f63974618 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -20381,7 +20381,7 @@ int main(int argc, char** argv) {
+             auto seg_dir = [&](const SegReq& r, int k, bool comp) -> std::string {
+                 if (!r.id.empty()) {
+                     const char* base = std::getenv("STRATA_SEGSTORE");
+-                    return std::string(base ? base : "/nvme/strata-segments") + "/" + r.id;
++                    return std::string(base ? base : "/nvme/strata-segments") + "/v2-" + r.id;   // F3.4 compact format
+                 }
+                 const char* d = std::getenv(comp ? "STRATA_SEGCOMP_DIR" : "STRATA_SEGCAP_DIR");
+                 if (d == nullptr) return std::string();
+@@ -20447,8 +20447,7 @@ int main(int argc, char** argv) {
+                     const char* sdir = cap_tmp.empty() ? nullptr : cap_tmp.c_str();
+                     std::string se;
+                     const uint64_t gf = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
+-                    if (sdir == nullptr || !strata::prefill::segcap_dump(ss.gdn_state, gf * (uint64_t) ss.gdn_alloc,
+-                                                                         std::string(sdir) + "/before.f32", se) ||
++                    if (sdir == nullptr || !strata::prefill::segcap_snapshot_before(ss.gdn_state, gf * (uint64_t) ss.gdn_alloc, se) ||
+                         !strata::prefill::segcap_begin(ss.gdn_alloc, std::min<int64_t>(to - at, 16384), se, ss.qsa_alloc, at, to - at))
+                         std::fprintf(stderr, "strata serve: seg capture not started: %s\n",
+                                      sdir ? se.c_str() : "no segment directory (STRATA_SEGCAP_DIR or an id)");
+@@ -20490,6 +20489,8 @@ int main(int argc, char** argv) {
+                                                                (int) strata::kernels::qsa_real_shapes().page_size,
+                                                                ss.ple_hist, (uint64_t) 9 * 10240, &cms, se, !req_segc_not);
+                     if (segc_done) {
++                        std::error_code fec;   // F3.5: last use = the directory's mtime (LRU for the janitor)
++                        std::filesystem::last_write_time(cdir_k, std::filesystem::file_time_type::clock::now(), fec);
+                         ss.ple_prev[0] = (int32_t) ids[(size_t) to - 2];
+                         ss.ple_prev[1] = (int32_t) ids[(size_t) to - 1];
+                     }
+@@ -20504,9 +20505,8 @@ int main(int argc, char** argv) {
+                     const char* sdir = cap_tmp.c_str();
+                     std::string se;
+                     const uint64_t gf = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
+-                    const bool w0 = sp_ok && strata::prefill::segcap_end(std::string(sdir) + "/T.f32", se) &&
+-                                    strata::prefill::segcap_dump(ss.gdn_state, gf * (uint64_t) ss.gdn_alloc,
+-                                                                 std::string(sdir) + "/after.f32", se);
++                    (void) gf;
++                    const bool w0 = sp_ok && strata::prefill::segcap_finish(sdir, ss.gdn_state, ss.gdn_alloc, se);   // F3.4
+                     auto seg_qsa = [&]() {   // F1: this session's QSA layers (INT8 K/V, every page resident)
+                         std::vector<strata::prefill::SegQsa> v;
+                         for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+-- 
+2.43.0
+

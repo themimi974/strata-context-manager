@@ -56,6 +56,14 @@ model or engine change is not detected (Strata still re-checks tokens on restore
 
 Enable it in the LiteLLM config with `litellm_settings: callbacks: strata_context_hook.handler`.
 
+File state cache (research, needs the Strata build with `strata_segx`; see [FILE-CACHE.md](FILE-CACHE.md)):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CTX_SEG` | `0` | mark file reads in the conversation so Strata stores and reloads their state |
+| `CTX_SEG_TOOLS` | `read_file` | tool names whose results are files (comma list or JSON list) |
+| `CTX_SEG_MIN_CHARS` | `4000` | smaller tool results are just read |
+
 ## Compose (`deploy/.env`)
 
 | Variable | Meaning |
@@ -65,7 +73,7 @@ Enable it in the LiteLLM config with `litellm_settings: callbacks: strata_contex
 | `MODEL_NAME` | the name clients ask for; keep it equal to `model_name` in `deploy/litellm-config.yaml` |
 | `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` | LiteLLM secrets (the master key must start with `sk-`; never change the salt key after first start) |
 | `POSTGRES_PASSWORD`, `CTX_DB_PASSWORD` | database passwords (LiteLLM's and the Context Manager's) |
-| `LITELLM_IMAGE`, `CONTEXT_MANAGER_IMAGE` | override the images (defaults: the published `0.1.1` tags) |
+| `LITELLM_IMAGE`, `CONTEXT_MANAGER_IMAGE` | override the images (defaults: the published `0.1.1` tags; build from this repo for the file cache) |
 | `LITELLM_BIND`, `LITELLM_PORT`, `CONTEXT_MANAGER_BIND`, `CONTEXT_MANAGER_PORT` | published ports; e.g. `LITELLM_BIND=127.0.0.1:` |
 
 ## Engine side (`/etc/default/strata-watchdog`, `/etc/default/strata-context`)

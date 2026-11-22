@@ -94,6 +94,8 @@ context size (131072). Hermes example and the other clients: [docs/DEPLOYMENT.md
 
 Downsides and known issues: [docs/LIMITS.md](docs/LIMITS.md) · [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)
 
+File state cache (research, off by default): [docs/FILE-CACHE.md](docs/FILE-CACHE.md).
+
 ## Repository
 
 | Path | What |
@@ -103,7 +105,7 @@ Downsides and known issues: [docs/LIMITS.md](docs/LIMITS.md) · [docs/KNOWN-ISSU
 | `migrations/` | database schema (Alembic) |
 | `deploy/` | compose file, LiteLLM config, `.env.example` |
 | `docker/litellm/` | LiteLLM image with the hook built in |
-| `engine/` | Strata-side watchdog, snapshot janitor, restart helper |
+| `engine/` | Strata-side watchdog, snapshot and file-cache janitors, restart helper |
 | `bench/` | the benchmark scripts used for the numbers above |
 | `docs/` | documentation |
 

@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from . import policy
 from .blocks import Validity, chain, request_blocks
 from .canon import move_volatile_lines
+from .segments import engine_spec, file_segments, tools_from_env
 from .engine import StrataAdapter
 
 MODE = os.environ.get("CTX_MODE", "passthrough")
@@ -54,6 +55,9 @@ def _patterns(raw: str) -> list[str] | None:
 VOLATILE_PATTERNS = _patterns(os.environ.get("CTX_VOLATILE_PATTERNS", ""))
 PIN_SYSTEM = os.environ.get("CTX_PIN_SYSTEM", "0") == "1"     # pin system + tools in Strata (strata_prefix)
 PIN_MIN_TOKENS = int(os.environ.get("CTX_PIN_MIN_TOKENS", "2048"))
+SEG = os.environ.get("CTX_SEG", "0") == "1"                     # file state cache (Strata research build): strata_segx
+SEG_TOOLS = tools_from_env(os.environ.get("CTX_SEG_TOOLS"))      # tools whose results are files (default read_file)
+SEG_MIN_CHARS = int(os.environ.get("CTX_SEG_MIN_CHARS", "4000"))  # smaller results are cheaper to read than to load
 RECORD = os.environ.get("CTX_RECORD", "")                       # benchmark: append every request (as sent) here
 PIN_WINDOW_H = float(os.environ.get("CTX_PIN_WINDOW_H", "6"))   # pin the most requested head over this window
 
@@ -187,8 +191,18 @@ async def observe(o: Observe):
             if policy.pin_allowed(head, {r["head_chain"]: r["n"] for r in rows}):
                 pin = {"messages": 1}
             await c.execute("UPDATE request_log SET pinned = $2 WHERE id = $1", rid, pin is not None)
+    segx = None
+    if SEG:   # F4: every file read in the request, named by its exact content; Strata loads or stores each one
+        segs = file_segments(o.messages, VALIDITY.root(), SEG_TOOLS, SEG_MIN_CHARS)
+        if segs:
+            segx = engine_spec(segs)
+            async with pool.acquire() as c:
+                for sg in segs:
+                    await c.execute("""INSERT INTO file_segment (seg_id, tool, chars) VALUES ($1, $2, $3)
+                                       ON CONFLICT (seg_id) DO UPDATE SET last_seen = now(),
+                                           seen_count = file_segment.seen_count + 1""", sg["id"], sg["tool"], sg["chars"])
     return {"mode": MODE, "n_blocks": len(blocks), "matched_depth": matched, "matched_tokens_est": offsets[matched],
-            "pin": pin,
+            "pin": pin, "segx": segx,
             "total_tokens_est": total, "volatile": volatile, "restored": restored,
             "messages": o.messages if moved else None, "moved_lines": moved}
 

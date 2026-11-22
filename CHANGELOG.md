@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 (2026-11-22)
+
+* File state cache (research, off by default, `CTX_SEG=1`): files the agent already read load from a stored state
+  instead of being read again (~0.5 s instead of ~9.5 s for a 9K-token file). Approximate: −2.6 ± 4.4 points on exact
+  reading questions overall, more in long multi-file sessions. Needs Strata with the patches in
+  `engine/strata-patches/`. See [docs/FILE-CACHE.md](docs/FILE-CACHE.md).
+* New table `file_segment` (migration 0004), settings `CTX_SEG`, `CTX_SEG_TOOLS`, `CTX_SEG_MIN_CHARS`.
+* `engine/strata-segments-janitor.sh`: keeps the file store under a budget, least recently used first.
+
 ## 0.1.1 (2026-11-21)
 
 Fixes found by deploying 0.1.0 from GitHub and Docker Hub on the reference lab.
