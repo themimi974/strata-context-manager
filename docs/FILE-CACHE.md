@@ -51,7 +51,7 @@ normal read again with only a hidden nonce changed (engine noise), and loaded fr
 ## Install
 
 1. Strata: use the `file-state-cache` branch of the fork https://github.com/themimi974/Strata (or apply
-   `engine/strata-patches/*.patch` on Strata `v0.2.16-4-g58ee32277` with `git am`), build, run with
+   `engine/strata-patches/*.patch` on Strata `v0.2.16-4-g58ee32277` with `git am`), build (MI100 build options: `FILE-STATE-CACHE.md` in that branch), run with
    `STRATA_SEGSTORE=/nvme/strata-segments` in the config's `env`.
 2. Janitor: copy `engine/strata-segments-janitor.sh` to `/usr/local/bin/strata-segments-janitor` and add the cron
    line from its header. Settings in `/etc/default/strata-context`: `SEG_DIR`, `SEG_BUDGET_GB`.
@@ -66,3 +66,5 @@ Roll back: `CTX_SEG=0` (Strata then reads every file normally; the patched engin
   12 attention layers, int8 KV).
 - The questions test exact reading of code, not whole agent tasks.
 - Only tools whose result is the file text are useful in `CTX_SEG_TOOLS`.
+- Only whole-file reads are cached. When the agent reads part of a file (Hermes' `read_file` with an offset or a
+  line range, e.g. for "what does line 123 say"), that text differs from the whole file, so it is read normally.
