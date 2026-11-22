@@ -1,0 +1,95 @@
+From 2823e93d8df6d7fce6801b1a53eaf07a2873e468 Mon Sep 17 00:00:00 2001
+From: f1-research <f1@localhost>
+Date: Sun, 22 Nov 2026 09:51:35 +0000
+Subject: [PATCH 4/5] F3.6: segx=a:e:id loads the stored file when its tokens
+ match, else reads and stores it
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LHC9HuRHHgU5cu8SqUTYdk
+---
+ engine/src/program/generate.cpp | 22 +++++++++++++++++++++-
+ terminal/serve/server.py        |  7 ++++++-
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index 8c1d1fcea..ae1c33f28 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -17743,7 +17743,7 @@ int main(int argc, char** argv) {
+             // F3.2: seg=a:e[:id],... captures each span (into $STRATA_SEGSTORE/<id>); segc=a:e[:id],... composes each
+             // span from its stored state instead of reading it.  Without an id: the F1 research directories.
+             struct SegReq { int64_t a, e; std::string id; };
+-            std::vector<SegReq> req_seg_caps, req_seg_comps;
++            std::vector<SegReq> req_seg_caps, req_seg_comps, req_seg_autos;   // F3.6 segx: load if stored, else capture
+             bool req_segc_not = false;   // F1.5: segc_not=1 composes without T (S0 only)
+             auto parse_segs = [](const std::string& list) {
+                 std::vector<SegReq> out;
+@@ -17800,6 +17800,7 @@ int main(int argc, char** argv) {
+                     else if (key == "segc") req_seg_comps = parse_segs(tok.substr(eq + 1));   // F3.2
+                     else if (key == "segc_not") req_segc_not = std::atoi(tok.c_str() + eq + 1) != 0;   // F1.5
+                     else if (key == "seg") req_seg_caps = parse_segs(tok.substr(eq + 1));   // F3.2
++                    else if (key == "segx") req_seg_autos = parse_segs(tok.substr(eq + 1));   // F3.6
+                     else if (key == "hold") {
+                         char* he = nullptr;
+                         const long long hn = std::strtoll(tok.c_str() + eq + 1, &he, 10);
+@@ -20351,6 +20352,25 @@ int main(int argc, char** argv) {
+             };
+             keep_segs(req_seg_caps, seg_caps, "seg");
+             keep_segs(req_seg_comps, seg_comps, "segc");
++            {   // F3.6 segx=a:e:id: compose when the store holds these exact tokens under that id, else read and capture
++                std::vector<SegReq> autos;
++                keep_segs(req_seg_autos, autos, "segx");
++                const char* base = std::getenv("STRATA_SEGSTORE");
++                for (const SegReq& r : autos) {
++                    if (r.id.empty()) continue;
++                    bool stored = false;
++                    std::FILE* tf = std::fopen((std::string(base ? base : "/nvme/strata-segments") + "/" + r.id + "/ids.i32").c_str(), "rb");
++                    if (tf != nullptr) {
++                        std::vector<int32_t> st((size_t) (r.e - r.a));
++                        stored = std::fread(st.data(), 4, st.size(), tf) == st.size() && std::fgetc(tf) == EOF;
++                        for (int64_t i = 0; stored && i < r.e - r.a; ++i) stored = st[(size_t) i] == (int32_t) ids[(size_t) (r.a + i)];
++                        std::fclose(tf);
++                    }
++                    (stored ? seg_comps : seg_caps).push_back(r);
++                    std::fprintf(stderr, "strata serve: segx %s [%lld, %lld): %s\n", r.id.c_str(), (long long) r.a, (long long) r.e,
++                                 stored ? "stored, compose" : "not stored, capture");
++                }
++            }
+             const bool seg_on = !seg_caps.empty(), segc_on = !seg_comps.empty();
+             if (seg_on || segc_on) {
+                 for (const SegReq& r : seg_caps) { cuts.push_back(r.a); cuts.push_back(r.e); }
+diff --git a/terminal/serve/server.py b/terminal/serve/server.py
+index 9c3991081..6b53192e9 100644
+--- a/terminal/serve/server.py
++++ b/terminal/serve/server.py
+@@ -1317,6 +1317,9 @@ class StrataEngine:
+             keys += f" segc={int(segc['tokens'][0])}:{int(segc['tokens'][1])}"
+         elif isinstance(segc, dict) and isinstance(segc.get("spans"), list) and segc["spans"]:   # F1.5: several spans
+             keys += " segc=" + ",".join(":".join(str(x) for x in sp) for sp in segc["spans"])
++        segx = sampling.get("strata_segx")   # F3.6: load each file if stored with these tokens, else read and store it
++        if isinstance(segx, dict) and isinstance(segx.get("spans"), list) and segx["spans"]:
++            keys += " segx=" + ",".join(":".join(str(x) for x in sp) for sp in segx["spans"])
+         if sampling.get("strata_segc_not"):   # F1.5: compose without T
+             keys += " segc_not=1"
+         if isinstance(prefix, dict):
+@@ -5109,6 +5112,8 @@ class Service:
+             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+         if req is not None and req.get("strata_seg") is not None:   # F1 (research)
+             req["strata_seg"] = self.resolve_segment(req["strata_seg"], messages, tools, kwargs, ids, bool(images))
++        if req is not None and req.get("strata_segx") is not None:   # F3.6
++            req["strata_segx"] = self.resolve_segment(req["strata_segx"], messages, tools, kwargs, ids, bool(images))
+         if req is not None and req.get("strata_segc") is not None:   # F1.3 (research)
+             req["strata_segc"] = self.resolve_segment(req["strata_segc"], messages, tools, kwargs, ids, bool(images))
+         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+@@ -7523,7 +7528,7 @@ def make_handler(svc: Service):
+             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+             if req.get("strata_dry"):   # F1 (research): the resolved prompt only, no engine run
+                 return self._json(200, {"prompt_tokens": len(ids), "strata_seg": req.get("strata_seg"),
+-                                        "strata_segc": req.get("strata_segc")})
++                                        "strata_segc": req.get("strata_segc"), "strata_segx": req.get("strata_segx")})
+             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                {t["name"] for t in extra}) if use_mcp else None
+             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+-- 
+2.43.0
+

@@ -1,0 +1,1014 @@
+From 5c51589dbd9c13cb6bac9e202b517bbf5bd6db98 Mon Sep 17 00:00:00 2001
+From: f1-research <f1@localhost>
+Date: Sat, 21 Nov 2026 23:12:51 +0000
+Subject: [PATCH 1/5] F1 research: file state capture (seg=), compose (segc=,
+ several spans, segc_not), dry run, GDN compose check
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LHC9HuRHHgU5cu8SqUTYdk
+---
+ engine/cmake/strata_gpu_engine.cmake          |   6 +-
+ .../strata/platform/hip_compat/strata_hip.h   |  26 ++
+ engine/include/strata/prefill/segcap.hpp      |  61 ++++
+ engine/src/kernels/gdn_compose_check.cpp      | 174 +++++++++++
+ engine/src/prefill/prefill.cpp                |   5 +
+ engine/src/prefill/segcap.cpp                 | 112 +++++++
+ engine/src/prefill/segcompose.cu              | 275 ++++++++++++++++++
+ engine/src/program/generate.cpp               | 133 ++++++++-
+ terminal/serve/server.py                      |  39 +++
+ 9 files changed, 828 insertions(+), 3 deletions(-)
+ create mode 100644 engine/include/strata/prefill/segcap.hpp
+ create mode 100644 engine/src/kernels/gdn_compose_check.cpp
+ create mode 100644 engine/src/prefill/segcap.cpp
+ create mode 100644 engine/src/prefill/segcompose.cu
+
+diff --git a/engine/cmake/strata_gpu_engine.cmake b/engine/cmake/strata_gpu_engine.cmake
+index 7db173282..04ea14d17 100644
+--- a/engine/cmake/strata_gpu_engine.cmake
++++ b/engine/cmake/strata_gpu_engine.cmake
+@@ -451,7 +451,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
+   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
+   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
+-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
++  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp src/prefill/segcap.cpp src/prefill/segcompose.cu)
+   if(STRATA_ENABLE_HIP)
+     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
+     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
+@@ -997,6 +997,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+     add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity --selftest)
+     set_tests_properties(gdn_chunk_parity PROPERTIES SKIP_RETURN_CODE 77)
++    # F1.1 (file state cache): the prompt recurrence is affine in its start state; T_C from the identity with v = 0
++    add_executable(gdn_compose_check src/kernels/gdn_compose_check.cpp)
++    target_include_directories(gdn_compose_check PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(gdn_compose_check PRIVATE strata_prefill ${_strata_gpu_runtime_target})
+ 
+     # v100/gdn-chunk: the micro benchmark (CUDA events, real GDN shapes): chunked vs recurrent prompt path.
+     add_executable(gdn_chunk_bench bench/gdn_chunk_bench.cpp)
+diff --git a/engine/include/strata/platform/hip_compat/strata_hip.h b/engine/include/strata/platform/hip_compat/strata_hip.h
+index 180a1f6d6..caee45742 100644
+--- a/engine/include/strata/platform/hip_compat/strata_hip.h
++++ b/engine/include/strata/platform/hip_compat/strata_hip.h
+@@ -307,3 +307,29 @@ static __device__ __forceinline__ unsigned int strata_byte_perm(unsigned int x,
+ #define __byte_perm(x, y, s) strata_byte_perm((unsigned int) (x), (unsigned int) (y), (unsigned int) (s))
+ 
+ #endif  // device side
++
++// --- local gfx908 additions: CUDA names missing from the compat list ---
++#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
++#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
++#define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
++#define cudaDeviceGetLimit hipDeviceGetLimit
++#define cudaDeviceSetLimit hipDeviceSetLimit
++#define cudaFuncAttributes hipFuncAttributes
++#define cudaFuncGetAttributes hipFuncGetAttributes
++#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
++#define cudaPointerAttributes hipPointerAttribute_t
++#define cudaPointerGetAttributes hipPointerGetAttributes
++#define cudaMemoryType hipMemoryType
++#define cudaMemoryTypeHost hipMemoryTypeHost
++#define cudaMemoryTypeDevice hipMemoryTypeDevice
++#define cudaMemoryTypeManaged hipMemoryTypeManaged
++#define cudaMemcpy2D hipMemcpy2D
++#define cudaMemcpyHostToHost hipMemcpyHostToHost
++#define cudaErrorInvalidValue hipErrorInvalidValue
++#define cudaErrorInvalidDevice hipErrorInvalidDevice
++#define cudaErrorNotSupported hipErrorNotSupported
++#define cudaErrorUnknown hipErrorUnknown
++#define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
++#define cudaDevAttrL2CacheSize hipDeviceAttributeL2CacheSize
++#define cudaDevAttrMaxSharedMemoryPerBlock hipDeviceAttributeMaxSharedMemoryPerBlock
++#define cudaDevAttrMaxSharedMemoryPerMultiprocessor hipDeviceAttributeMaxSharedMemoryPerMultiprocessor
+diff --git a/engine/include/strata/prefill/segcap.hpp b/engine/include/strata/prefill/segcap.hpp
+new file mode 100644
+index 000000000..df518daee
+--- /dev/null
++++ b/engine/include/strata/prefill/segcap.hpp
+@@ -0,0 +1,61 @@
++// include/strata/prefill/segcap.hpp - F1 (file state cache) capture: while a marked prompt span is read, every GDN
++// layer also runs its state-only recurrence from the identity with v = 0, which leaves the span's transition operator
++// T_C in a per-layer buffer (W_after = T_C W_before + S(C|0); verified by gdn_compose_check).
++//
++// Research build only (branch f1-file-state).  Off unless a request carries seg=A:B; then the serve loop calls
++// segcap_begin before reading [A, B) as one batched part and segcap_end after it, and the prompt path calls
++// segcap_layer once per GDN layer per chunk.  Buffers are allocated in segcap_begin, never inside the layer loop.
++#pragma once
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace strata::prefill {
++
++struct SegCap {
++    bool active = false;
++    int64_t n_gdn = 0;          ///< GDN layers whose operator is kept (the session's gdn_alloc)
++    int64_t max_t = 0;          ///< largest chunk the scratch holds
++    float* T = nullptr;         ///< (n_gdn, 128, 48, 128) fp32, j fastest - the state layout
++    float* hz = nullptr;        ///< (max_t, 10240): the chunk's conv output with the v columns zeroed
++    float* yz = nullptr;        ///< (max_t, 48, 128): the recurrence's y scratch (unused output)
++    int64_t calls = 0;          ///< segcap_layer calls since segcap_begin (36 x chunks expected)
++    int64_t tokens = 0;         ///< tokens seen by GDN layer 0 since segcap_begin
++    bool overflow = false;      ///< a chunk was larger than max_t: the capture is invalid
++};
++
++SegCap& segcap();
++
++/// Allocates (once, grow-only) and sets every layer's operator to the identity. max_t: the largest chunk expected.
++bool segcap_begin(int64_t n_gdn, int64_t max_t, std::string& err);
++/// One GDN layer's chunk: copies h, zeroes its v columns and runs the state-only recurrence into T[gdn_ord].
++void segcap_layer(int64_t gdn_ord, const float* h, const float* gate, const float* beta, int64_t T, void* stream);
++/// Synchronizes, writes T (n_gdn x layer floats) to `path`, turns the capture off.
++bool segcap_end(const std::string& path, std::string& err);
++/// Synchronizes and writes `floats` floats of device memory to `path` (the GDN state before / after the span).
++bool segcap_dump(const float* dev, uint64_t floats, const std::string& path, std::string& err);
++
++/// One QSA layer's device pointers (filled from core::QsaState by the caller; INT8 KV, all pages resident).
++struct SegQsa {
++    int8_t* k_q;
++    int8_t* v_q;
++    uint16_t* k_scale;
++    uint16_t* v_scale;
++    const int32_t* page_table;
++    float* pooled;
++    const float* cos_tab;
++    const float* sin_tab;
++};
++
++/// F1.3 capture, at the span's end: the span's K/V cells and scales, its pooled indexer rows (both ends multiples of 4)
++/// and the PLE history, to dir/qsa.bin, dir/ple.f32, dir/meta.txt.
++bool segcap_save_qsa(const std::vector<SegQsa>& layers, int page_size, int64_t a, int64_t e, const float* ple_hist,
++                     uint64_t ple_floats, const std::string& dir, std::string& err);
++/// F1.3 compose: instead of reading [a, e), set the GDN state to W_after + T (W - W_before) (conv rows: the capture's),
++/// write the captured K/V into cells [a, e) re-rotated by a - captured_a, the pooled rows likewise (the spare slot moved
++/// to row e/4), and the PLE history.  The caller sets ple_prev.  `ms`: GPU time of the composition.
++bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_state, int64_t n_gdn,
++                   const std::vector<SegQsa>& layers, int page_size, float* ple_hist, uint64_t ple_floats, double* ms,
++                   std::string& err, bool use_t = true);
++
++}  // namespace strata::prefill
+diff --git a/engine/src/kernels/gdn_compose_check.cpp b/engine/src/kernels/gdn_compose_check.cpp
+new file mode 100644
+index 000000000..b7629bb56
+--- /dev/null
++++ b/engine/src/kernels/gdn_compose_check.cpp
+@@ -0,0 +1,174 @@
++// src/kernels/gdn_compose_check.cpp - F1.1 (file state cache): the GDN prompt recurrence is affine in its starting
++// state, and the existing kernel computes the transition operator when started from the identity with v = 0.
++//
++// For one segment of T tokens (fixed q, k, v, gate, beta) the recurrence per head and value column j is
++//     W_t[:, j] = a_t (I - beta_t k_t k_t^T) W_{t-1}[:, j] + beta_t k_t v_t[j]
++// so  W_end = T_C W_0 + S(C|0)  with  T_C = A_T ... A_1 (128 x 128 per v-head).
++// Because the state has exactly 128 value columns, running the unchanged kernel from W_0 = I with v = 0 leaves
++// T_C in the state, and running it from W_0 = 0 leaves S(C|0).  This test checks, on the real dispatch
++// (`gdn_recurrence`, the path the prompt uses on this GPU), that
++//   1. W_end(W_0) == T_C W_0 + S(C|0)                          (affinity, FP32 level)
++//   2. T_{AB} == T_B T_A and S_{AB} == T_B S_A + S_B             (two segments chain)
++// GPU, synthetic, no model, < 100 MB of device memory.
++#include "strata/prefill/kernels.hpp"
++#include <cuda_runtime.h>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++namespace {
++constexpr int S = 128, HK = 16, HV = 48, C = 10240;
++constexpr size_t NST = (size_t) S * HV * S;   // state floats: [i][h][j], j fastest
++
++struct Rng {
++    uint64_t s = 0x9e3779b97f4a7c15ull;
++    float uni() {
++        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
++        return (float) ((s >> 11) * (1.0 / 9007199254740992.0));
++    }
++};
++
++void check(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "gdn_compose_check: %s: %s\n", what, cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
++struct Seg {
++    int T;
++    std::vector<float> h, gate, beta, z;
++};
++
++Seg make_seg(Rng& rng, int T, float gate_lo, float gate_span) {
++    Seg s{T, std::vector<float>((size_t) T * C), std::vector<float>((size_t) T * HV), std::vector<float>((size_t) T * HV),
++          std::vector<float>((size_t) T * HV * S)};
++    for (int t = 0; t < T; ++t) {
++        for (int qh = 0; qh < HK; ++qh)
++            for (int part = 0; part < 2; ++part) {
++                double ss = 0;
++                float row[S];
++                for (int i = 0; i < S; ++i) { row[i] = rng.uni() - 0.5f; ss += (double) row[i] * row[i]; }
++                const float nrm = (float) (1.0 / std::sqrt(ss + 1e-5));
++                for (int i = 0; i < S; ++i) s.h[(size_t) t * C + (part ? HK * S : 0) + qh * S + i] = row[i] * nrm;
++            }
++        for (int hh = 0; hh < HV; ++hh) {
++            for (int j = 0; j < S; ++j) s.h[(size_t) t * C + 2 * HK * S + hh * S + j] = rng.uni() - 0.5f;
++            s.gate[(size_t) t * HV + hh] = -(gate_lo + gate_span * rng.uni());
++            s.beta[(size_t) t * HV + hh] = 1.0f / (1.0f + std::exp(-(4.0f * rng.uni() - 2.0f)));
++            for (int j = 0; j < S; ++j) s.z[((size_t) t * HV + hh) * S + j] = 2.0f * rng.uni() - 1.0f;
++        }
++    }
++    return s;
++}
++
++struct Dev {
++    float *st, *h, *g, *b, *z, *ga, *y;
++    uint16_t* y16;
++    int Tmax;
++};
++
++// Runs the real prompt recurrence over `seg` from `st0`; zero_v replaces every v row by zeros.
++std::vector<float> run(Dev& d, const Seg& seg, const std::vector<float>& st0, const std::vector<float>& gamma,
++                       bool zero_v) {
++    std::vector<float> h = seg.h;
++    if (zero_v)
++        for (int t = 0; t < seg.T; ++t)
++            for (int c = 2 * HK * S; c < C; ++c) h[(size_t) t * C + c] = 0.0f;
++    check(cudaMemcpy(d.st, st0.data(), NST * 4, cudaMemcpyHostToDevice), "H2D st");
++    check(cudaMemcpy(d.h, h.data(), h.size() * 4, cudaMemcpyHostToDevice), "H2D h");
++    check(cudaMemcpy(d.g, seg.gate.data(), seg.gate.size() * 4, cudaMemcpyHostToDevice), "H2D g");
++    check(cudaMemcpy(d.b, seg.beta.data(), seg.beta.size() * 4, cudaMemcpyHostToDevice), "H2D b");
++    check(cudaMemcpy(d.z, seg.z.data(), seg.z.size() * 4, cudaMemcpyHostToDevice), "H2D z");
++    check(cudaMemcpy(d.ga, gamma.data(), gamma.size() * 4, cudaMemcpyHostToDevice), "H2D gamma");
++    strata::prefill::gdn_recurrence(d.st, d.h, d.g, d.b, d.z, d.ga, 1e-5f, d.y, d.y16, seg.T, nullptr);
++    check(cudaDeviceSynchronize(), "sync");
++    std::vector<float> out(NST);
++    check(cudaMemcpy(out.data(), d.st, NST * 4, cudaMemcpyDeviceToHost), "D2H st");
++    return out;
++}
++
++std::vector<float> identity() {
++    std::vector<float> I(NST, 0.0f);
++    for (int h = 0; h < HV; ++h)
++        for (int i = 0; i < S; ++i) I[((size_t) i * HV + h) * S + i] = 1.0f;
++    return I;
++}
++
++// out = A W (+ add), per head: out[i][h][j] = sum_m A[i][h][m] W[m][h][j]
++std::vector<float> apply(const std::vector<float>& A, const std::vector<float>& W, const std::vector<float>* add) {
++    std::vector<float> out(NST, 0.0f);
++    for (int h = 0; h < HV; ++h)
++        for (int i = 0; i < S; ++i)
++            for (int j = 0; j < S; ++j) {
++                double acc = add ? (*add)[((size_t) i * HV + h) * S + j] : 0.0;
++                for (int m = 0; m < S; ++m)
++                    acc += (double) A[((size_t) i * HV + h) * S + m] * W[((size_t) m * HV + h) * S + j];
++                out[((size_t) i * HV + h) * S + j] = (float) acc;
++            }
++    return out;
++}
++
++double rel_err(const std::vector<float>& a, const std::vector<float>& b) {
++    double num = 0, den = 0;
++    for (size_t i = 0; i < a.size(); ++i) { num += (double) (a[i] - b[i]) * (a[i] - b[i]); den += (double) b[i] * b[i]; }
++    return std::sqrt(num / (den + 1e-30));
++}
++
++double frob(const std::vector<float>& a) {
++    double s = 0;
++    for (float x : a) s += (double) x * x;
++    return std::sqrt(s);
++}
++}  // namespace
++
++int main(int argc, char** argv) {
++    const int T1 = argc > 1 ? std::atoi(argv[1]) : 300;
++    const int T2 = argc > 2 ? std::atoi(argv[2]) : 200;
++    const float gate_lo = argc > 3 ? (float) std::atof(argv[3]) : 0.02f;    // -gate in [lo, lo + span]
++    const float gate_span = argc > 4 ? (float) std::atof(argv[4]) : 0.3f;
++    Rng rng;
++    Seg A = make_seg(rng, T1, gate_lo, gate_span), B = make_seg(rng, T2, gate_lo, gate_span);
++    std::vector<float> gamma(S);
++    for (int j = 0; j < S; ++j) gamma[j] = 0.5f + 2.0f * rng.uni();
++    std::vector<float> W0(NST);
++    for (float& x : W0) x = 0.1f * (rng.uni() - 0.5f);
++
++    Dev d{};
++    const int Tmax = T1 > T2 ? T1 : T2;
++    check(cudaMalloc(&d.st, NST * 4), "malloc");
++    check(cudaMalloc(&d.h, (size_t) Tmax * C * 4), "malloc");
++    check(cudaMalloc(&d.g, (size_t) Tmax * HV * 4), "malloc");
++    check(cudaMalloc(&d.b, (size_t) Tmax * HV * 4), "malloc");
++    check(cudaMalloc(&d.z, (size_t) Tmax * HV * S * 4), "malloc");
++    check(cudaMalloc(&d.ga, S * 4), "malloc");
++    check(cudaMalloc(&d.y, (size_t) Tmax * HV * S * 4), "malloc");
++    check(cudaMalloc(&d.y16, (size_t) Tmax * HV * S * 2), "malloc");
++    d.Tmax = Tmax;
++
++    const std::vector<float> I = identity(), Z(NST, 0.0f);
++    // 1. affinity on segment A
++    const std::vector<float> W1 = run(d, A, W0, gamma, false);
++    const std::vector<float> TA = run(d, A, I, gamma, true);
++    const std::vector<float> SA = run(d, A, Z, gamma, false);
++    const std::vector<float> W1p = apply(TA, W0, &SA);
++    const double e1 = rel_err(W1p, W1);
++    // 2. chaining A then B
++    const std::vector<float> TB = run(d, B, I, gamma, true);
++    const std::vector<float> SB = run(d, B, Z, gamma, false);
++    const std::vector<float> W2 = run(d, B, W1, gamma, false);                    // the real A then B
++    const std::vector<float> W2p = apply(TB, apply(TA, W0, &SA), &SB);            // composed from the two operators
++    const double e2 = rel_err(W2p, W2);
++    // 3. how much the start state still matters at the end: ||T_A W0|| / ||W1||
++    const double carry = frob(apply(TA, W0, nullptr)) / (frob(W1) + 1e-30);
++
++    std::printf("segments T1=%d T2=%d, -gate in [%.3f, %.3f]\n", T1, T2, gate_lo, gate_lo + gate_span);
++    std::printf("1. affinity   rel err W_end vs T_C W0 + S(C|0): %.3e\n", e1);
++    std::printf("2. chaining   rel err [A][B] vs T_B(T_A W0 + S_A) + S_B: %.3e\n", e2);
++    std::printf("3. carry      ||T_A W0|| / ||W_end||: %.3e  (share of the end state that comes from before the segment)\n", carry);
++    const bool ok = e1 < 1e-4 && e2 < 1e-4;
++    std::printf("%s\n", ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
++}
+diff --git a/engine/src/prefill/prefill.cpp b/engine/src/prefill/prefill.cpp
+index 559888758..d697ff6af 100644
+--- a/engine/src/prefill/prefill.cpp
++++ b/engine/src/prefill/prefill.cpp
+@@ -1,6 +1,7 @@
+ // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+ #include "strata/kernels/fused_gr.hpp"
+ #include "strata/prefill/prefill.hpp"
++#include "strata/prefill/segcap.hpp"   // F1: file state capture
+ #include "strata/prefill/copy_events.hpp"
+ #include "strata/prefill/timer_marks.hpp"
+ #include "strata/prefill/mmq_ids_margin.hpp"
+@@ -4967,6 +4968,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                     else
+                         gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
+                                        ld_y);
++                    if (strata::prefill::segcap().active)   // F1: the span's transition operator, from the identity
++                        strata::prefill::segcap_layer(gdn_index - ss.gdn_ord0, m.hbuf, m.gate, m.beta, T, m.cs);
+                     pt.mark(kPfGdnOut, cs);
+                     if (!kva_state_only)   // KVA: the out projection feeds only the residual write and the MoE half
+                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+@@ -8701,6 +8704,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                         pt.mark(kPfGdnRec, cs);
+                         if (!fused_gdn)
+                             gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, cs);
++                        if (strata::prefill::segcap().active)   // F1: the span's transition operator, from the identity
++                            strata::prefill::segcap_layer(gdn_index - ssp->gdn_ord0, m.hbuf, m.gate, m.beta, T, cs);
+                         pt.mark(kPfGdnOut, cs);
+                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                         ++gdn_index;
+diff --git a/engine/src/prefill/segcap.cpp b/engine/src/prefill/segcap.cpp
+new file mode 100644
+index 000000000..4d484db7d
+--- /dev/null
++++ b/engine/src/prefill/segcap.cpp
+@@ -0,0 +1,112 @@
++// src/prefill/segcap.cpp - see include/strata/prefill/segcap.hpp (F1 research build).
++#include "strata/prefill/segcap.hpp"
++#include "strata/prefill/kernels.hpp"
++#include <cuda_runtime.h>
++#include <cstdio>
++#include <vector>
++#if defined(cudaMemsetAsync) && !defined(cudaMemset2DAsync)   // the HIP build maps cuda* names by macro
++#define cudaMemset2DAsync hipMemset2DAsync   // not in the hip_compat list
++#endif
++
++namespace strata::prefill {
++namespace {
++constexpr int64_t S = 128, HK = 16, HV = 48, C = 10240;
++constexpr uint64_t NST = (uint64_t) S * HV * S;   // one layer's recurrent state, floats
++
++bool ok(cudaError_t e, const char* what, std::string& err) {
++    if (e == cudaSuccess) return true;
++    err = std::string("segcap: ") + what + ": " + cudaGetErrorString(e);
++    return false;
++}
++
++bool write_file(const std::string& path, const std::vector<float>& v, std::string& err) {
++    std::FILE* f = std::fopen(path.c_str(), "wb");
++    if (f == nullptr) {
++        err = "segcap: cannot write " + path;
++        return false;
++    }
++    const bool w = std::fwrite(v.data(), sizeof(float), v.size(), f) == v.size();
++    std::fclose(f);
++    if (!w) err = "segcap: short write " + path;
++    return w;
++}
++}  // namespace
++
++SegCap& segcap() {
++    static SegCap s;
++    return s;
++}
++
++bool segcap_begin(int64_t n_gdn, int64_t max_t, std::string& err) {
++    SegCap& s = segcap();
++    if (n_gdn <= 0 || max_t <= 0) {
++        err = "segcap: nothing to capture";
++        return false;
++    }
++    if (s.T == nullptr || s.n_gdn < n_gdn) {
++        if (s.T) cudaFree(s.T);
++        s.T = nullptr;
++        if (!ok(cudaMalloc(&s.T, (size_t) n_gdn * NST * sizeof(float)), "T", err)) return false;
++        s.n_gdn = n_gdn;
++    }
++    if (s.max_t < max_t) {
++        if (s.hz) cudaFree(s.hz);
++        if (s.yz) cudaFree(s.yz);
++        s.hz = s.yz = nullptr;
++        if (!ok(cudaMalloc(&s.hz, (size_t) max_t * C * sizeof(float)), "hz", err)) return false;
++        if (!ok(cudaMalloc(&s.yz, (size_t) max_t * HV * S * sizeof(float)), "yz", err)) return false;
++        s.max_t = max_t;
++    }
++    std::vector<float> I(NST, 0.0f);   // identity per v-head: element [i][h][i] = 1
++    for (int64_t h = 0; h < HV; ++h)
++        for (int64_t i = 0; i < S; ++i) I[((size_t) i * HV + h) * S + i] = 1.0f;
++    for (int64_t l = 0; l < n_gdn; ++l)
++        if (!ok(cudaMemcpy(s.T + (size_t) l * NST, I.data(), NST * sizeof(float), cudaMemcpyHostToDevice), "identity",
++                err))
++            return false;
++    s.calls = s.tokens = 0;
++    s.overflow = false;
++    s.active = true;
++    return true;
++}
++
++void segcap_layer(int64_t gdn_ord, const float* h, const float* gate, const float* beta, int64_t T, void* stream) {
++    SegCap& s = segcap();
++    if (!s.active) return;
++    if (T > s.max_t || gdn_ord < 0 || gdn_ord >= s.n_gdn) {
++        s.overflow = true;
++        return;
++    }
++    const cudaStream_t st = (cudaStream_t) stream;
++    cudaMemcpyAsync(s.hz, h, (size_t) T * C * sizeof(float), cudaMemcpyDeviceToDevice, st);
++    // v columns of every row: [2*HK*S, C)
++    cudaMemset2DAsync(s.hz + 2 * HK * S, (size_t) C * sizeof(float), 0, (size_t) (C - 2 * HK * S) * sizeof(float),
++                      (size_t) T, st);
++    gdn_recurrence_state_only(s.T + (size_t) gdn_ord * NST, s.hz, gate, beta, s.yz, T, stream);
++    ++s.calls;
++    if (gdn_ord == 0) s.tokens += T;
++}
++
++bool segcap_end(const std::string& path, std::string& err) {
++    SegCap& s = segcap();
++    s.active = false;
++    if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
++    if (s.overflow) {
++        err = "segcap: a chunk was larger than the scratch: capture invalid";
++        return false;
++    }
++    std::vector<float> host((size_t) s.n_gdn * NST);
++    if (!ok(cudaMemcpy(host.data(), s.T, host.size() * sizeof(float), cudaMemcpyDeviceToHost), "T D2H", err))
++        return false;
++    return write_file(path, host, err);
++}
++
++bool segcap_dump(const float* dev, uint64_t floats, const std::string& path, std::string& err) {
++    if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
++    std::vector<float> host((size_t) floats);
++    if (!ok(cudaMemcpy(host.data(), dev, host.size() * sizeof(float), cudaMemcpyDeviceToHost), "state D2H", err))
++        return false;
++    return write_file(path, host, err);
++}
++
++}  // namespace strata::prefill
+diff --git a/engine/src/prefill/segcompose.cu b/engine/src/prefill/segcompose.cu
+new file mode 100644
+index 000000000..3d5fe0e2c
+--- /dev/null
++++ b/engine/src/prefill/segcompose.cu
+@@ -0,0 +1,275 @@
++// src/prefill/segcompose.cu - F1.3 (file state cache, research build): save a captured span's QSA state, and compose a
++// captured span into another sequence at a shifted position.  See include/strata/prefill/segcap.hpp.
++//
++// Layouts (kv_q8.hpp, qsa.hpp): codes [page][kv_head][page_size][head_dim] int8, scales [page][kv_head][page_size]
++// [head_dim/64] fp16 bits; cell t -> page = page_table[t / page_size].  Keys are stored AFTER RoPE (NEOX: dim i pairs
++// with i + n_rot/2 inside the first n_rot dims); with n_rot = 64 the rotated slice is exactly scale group 0, so a shift
++// by D re-rotates that group (dequantise, rotate by D, requantise) and leaves groups 1..3 and all of V untouched.
++// Pooled indexer keys: fp32 rows of idx_dim, block b rotated at the block's first cell, same pairing.
++#include "strata/prefill/segcap.hpp"
++#include <cuda_runtime.h>
++#include <cuda_fp16.h>
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++namespace strata::prefill {
++namespace {
++constexpr int HD = 256, NKV = 2, G = 64, NG = HD / G, NROT = 64, IDX = 128;
++constexpr int64_t S = 128, HV = 48;
++constexpr uint64_t NST = (uint64_t) S * HV * S, CONV = 10240 * 3;
++
++bool ok(cudaError_t e, const char* what, std::string& err) {
++    if (e == cudaSuccess) return true;
++    err = std::string("segcompose: ") + what + ": " + cudaGetErrorString(e);
++    return false;
++}
++
++__device__ inline size_t cell_row(const int32_t* table, int64_t t, int page_size, int h) {
++    const int64_t page = table[t / page_size];
++    return ((size_t) page * NKV + h) * page_size + (size_t) (t % page_size);
++}
++
++// one block per (cell, head): copy codes and scales of cells [a, a + n) into a compact buffer
++__global__ void kv_gather(const int8_t* kq, const int8_t* vq, const uint16_t* ks, const uint16_t* vs, const int32_t* table,
++                          int page_size, int64_t a, int8_t* ok_, int8_t* ov_, uint16_t* oks, uint16_t* ovs) {
++    const int64_t c = blockIdx.x;
++    const int h = blockIdx.y;
++    const size_t row = cell_row(table, a + c, page_size, h), dst = (size_t) c * NKV + h;
++    for (int d = threadIdx.x; d < HD; d += blockDim.x) {
++        ok_[dst * HD + d] = kq[row * HD + d];
++        ov_[dst * HD + d] = vq[row * HD + d];
++    }
++    if (threadIdx.x < NG) {
++        oks[dst * NG + threadIdx.x] = ks[row * NG + threadIdx.x];
++        ovs[dst * NG + threadIdx.x] = vs[row * NG + threadIdx.x];
++    }
++}
++
++__device__ inline float h2f(uint16_t b) { return __half2float(__ushort_as_half(b)); }
++__device__ inline uint16_t f2h(float f) { return __half_as_ushort(__float2half(f)); }
++
++// one block (64 threads) per (cell, head): scatter into cells [a, a + n), K group 0 re-rotated by D
++__global__ void kv_scatter_shift(int8_t* kq, int8_t* vq, uint16_t* ks, uint16_t* vs, const int32_t* table, int page_size,
++                                 int64_t a, const int8_t* ik, const int8_t* iv, const uint16_t* iks, const uint16_t* ivs,
++                                 const float* cos_tab, const float* sin_tab, int64_t D) {
++    const int64_t c = blockIdx.x;
++    const int h = blockIdx.y;
++    const size_t row = cell_row(table, a + c, page_size, h), src = (size_t) c * NKV + h;
++    for (int d = threadIdx.x; d < HD; d += blockDim.x) {
++        vq[row * HD + d] = iv[src * HD + d];
++        if (d >= G) kq[row * HD + d] = ik[src * HD + d];
++    }
++    if (threadIdx.x < NG) {
++        vs[row * NG + threadIdx.x] = ivs[src * NG + threadIdx.x];
++        if (threadIdx.x > 0) ks[row * NG + threadIdx.x] = iks[src * NG + threadIdx.x];
++    }
++    __shared__ float x[G];
++    __shared__ float amax[G];
++    const int i = threadIdx.x;   // 0..63
++    const float sc = h2f(iks[src * NG + 0]);
++    x[i] = (float) ik[src * HD + i] * sc;
++    __syncthreads();
++    float y = x[i];
++    if (i < NROT / 2) {
++        const int64_t p = D >= 0 ? D : -D;
++        const float cs = cos_tab[p * (NROT / 2) + i], sn = (D >= 0 ? 1.0f : -1.0f) * sin_tab[p * (NROT / 2) + i];
++        y = x[i] * cs - x[i + NROT / 2] * sn;
++    } else if (i < NROT) {
++        const int j = i - NROT / 2;
++        const int64_t p = D >= 0 ? D : -D;
++        const float cs = cos_tab[p * (NROT / 2) + j], sn = (D >= 0 ? 1.0f : -1.0f) * sin_tab[p * (NROT / 2) + j];
++        y = x[j] * sn + x[i] * cs;
++    }
++    __syncthreads();
++    x[i] = y;
++    amax[i] = fabsf(y);
++    __syncthreads();
++    for (int s = G / 2; s > 0; s >>= 1) {
++        if (i < s) amax[i] = fmaxf(amax[i], amax[i + s]);
++        __syncthreads();
++    }
++    const uint16_t nsb = f2h(amax[0] / 127.0f);
++    const float ns = h2f(nsb);
++    const float q = ns > 0.0f ? rintf(x[i] / ns) : 0.0f;
++    kq[row * HD + i] = (int8_t) fminf(127.0f, fmaxf(-127.0f, q));
++    if (i == 0) ks[row * NG + 0] = nsb;
++}
++
++// pooled rows: out[r] = rotate(in[r], D) on the first NROT dims
++__global__ void pooled_shift(float* pooled, int64_t row0, const float* in, int64_t n, const float* cos_tab,
++                             const float* sin_tab, int64_t D) {
++    const int64_t r = blockIdx.x;
++    const int i = threadIdx.x;   // 0..127
++    const float* src = in + r * IDX;
++    float y = src[i];
++    const int64_t p = D >= 0 ? D : -D;
++    const float sg = D >= 0 ? 1.0f : -1.0f;
++    if (i < NROT / 2) {
++        y = src[i] * cos_tab[p * (NROT / 2) + i] - src[i + NROT / 2] * sg * sin_tab[p * (NROT / 2) + i];
++    } else if (i < NROT) {
++        const int j = i - NROT / 2;
++        y = src[j] * sg * sin_tab[p * (NROT / 2) + j] + src[i] * cos_tab[p * (NROT / 2) + j];
++    }
++    pooled[(row0 + r) * IDX + i] = y;
++}
++
++// W_new = Wa + T (Wc - Wb) per layer and v-head; recurrent part only.  One thread per (l, i, h, j).
++__global__ void gdn_compose(const float* T, const float* Wb, const float* Wa, const float* Wc, float* out, int64_t L,
++                            uint64_t stride, int use_cur) {
++    const uint64_t idx = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= (uint64_t) L * NST) return;
++    const uint64_t l = idx / NST, e = idx % NST;
++    const uint64_t i = e / (HV * S), h = (e / S) % HV, j = e % S;
++    const float* Tl = T + l * NST;
++    const float* Bl = Wb + l * stride;
++    const float* Cl = Wc + l * stride;
++    double acc = Wa[l * stride + e];
++    for (uint64_t m = 0; m < (uint64_t) S; ++m) {
++        const uint64_t tm = (i * HV + h) * S + m, wm = (m * HV + h) * S + j;
++        acc += (double) Tl[tm] * ((use_cur ? (double) Cl[wm] : 0.0) - (double) Bl[wm]);
++    }
++    out[l * NST + e] = (float) acc;
++}
++
++bool read_file(const std::string& path, std::vector<char>& v, std::string& err) {
++    std::FILE* f = std::fopen(path.c_str(), "rb");
++    if (!f) { err = "segcompose: cannot read " + path; return false; }
++    std::fseek(f, 0, SEEK_END);
++    const long n = std::ftell(f);
++    std::fseek(f, 0, SEEK_SET);
++    v.resize((size_t) n);
++    const bool r = std::fread(v.data(), 1, v.size(), f) == v.size();
++    std::fclose(f);
++    if (!r) err = "segcompose: short read " + path;
++    return r;
++}
++
++bool write_file(const std::string& path, const void* p, size_t n, std::string& err) {
++    std::FILE* f = std::fopen(path.c_str(), "wb");
++    if (!f) { err = "segcompose: cannot write " + path; return false; }
++    const bool w = std::fwrite(p, 1, n, f) == n;
++    std::fclose(f);
++    if (!w) err = "segcompose: short write " + path;
++    return w;
++}
++
++template <class X>
++bool to_dev(const std::vector<char>& h, X** d, std::string& err) {
++    if (!ok(cudaMalloc((void**) d, h.size()), "malloc", err)) return false;
++    return ok(cudaMemcpy(*d, h.data(), h.size(), cudaMemcpyHostToDevice), "H2D", err);
++}
++}  // namespace
++
++bool segcap_save_qsa(const std::vector<SegQsa>& layers, int page_size, int64_t a, int64_t e, const float* ple_hist,
++                     uint64_t ple_floats, const std::string& dir, std::string& err) {
++    if (!ok(cudaDeviceSynchronize(), "sync", err)) return false;
++    const int64_t n = e - a;
++    const size_t codes = (size_t) n * NKV * HD, scales = (size_t) n * NKV * NG;
++    std::vector<char> blob;
++    int8_t *dk, *dv;
++    uint16_t *dks, *dvs;
++    if (!ok(cudaMalloc(&dk, codes), "malloc", err) || !ok(cudaMalloc(&dv, codes), "malloc", err) ||
++        !ok(cudaMalloc(&dks, scales * 2), "malloc", err) || !ok(cudaMalloc(&dvs, scales * 2), "malloc", err))
++        return false;
++    const int64_t b0 = a / 4, b1 = e / 4;
++    for (const SegQsa& q : layers) {
++        kv_gather<<<dim3((unsigned) n, NKV), 64>>>(q.k_q, q.v_q, q.k_scale, q.v_scale, q.page_table, page_size, a, dk, dv,
++                                                    dks, dvs);
++        if (!ok(cudaDeviceSynchronize(), "gather", err)) return false;
++        const size_t off = blob.size();
++        const size_t pooled = (size_t) (b1 - b0) * IDX * sizeof(float);
++        blob.resize(off + 2 * codes + 2 * scales * 2 + pooled);
++        char* p = blob.data() + off;
++        if (!ok(cudaMemcpy(p, dk, codes, cudaMemcpyDeviceToHost), "D2H", err) ||
++            !ok(cudaMemcpy(p + codes, dv, codes, cudaMemcpyDeviceToHost), "D2H", err) ||
++            !ok(cudaMemcpy(p + 2 * codes, dks, scales * 2, cudaMemcpyDeviceToHost), "D2H", err) ||
++            !ok(cudaMemcpy(p + 2 * codes + scales * 2, dvs, scales * 2, cudaMemcpyDeviceToHost), "D2H", err) ||
++            !ok(cudaMemcpy(p + 2 * codes + 4 * scales, q.pooled + (size_t) b0 * IDX, pooled, cudaMemcpyDeviceToHost), "D2H",
++                err))
++            return false;
++    }
++    cudaFree(dk); cudaFree(dv); cudaFree(dks); cudaFree(dvs);
++    std::vector<float> ple((size_t) ple_floats);
++    if (ple_floats && !ok(cudaMemcpy(ple.data(), ple_hist, ple_floats * 4, cudaMemcpyDeviceToHost), "ple D2H", err))
++        return false;
++    char meta[128];
++    const int m = std::snprintf(meta, sizeof meta, "%lld %lld %d %zu\n", (long long) a, (long long) e, page_size,
++                                layers.size());
++    return write_file(dir + "/qsa.bin", blob.data(), blob.size(), err) &&
++           write_file(dir + "/ple.f32", ple.data(), ple.size() * 4, err) && write_file(dir + "/meta.txt", meta, (size_t) m, err);
++}
++
++bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_state, int64_t n_gdn,
++                   const std::vector<SegQsa>& layers, int page_size, float* ple_hist, uint64_t ple_floats, double* ms,
++                   std::string& err, bool use_t) {
++    cudaEvent_t t0, t1;
++    cudaEventCreate(&t0);
++    cudaEventCreate(&t1);
++    // meta: the captured span
++    std::vector<char> meta;
++    if (!read_file(dir + "/meta.txt", meta, err)) return false;
++    meta.push_back('\0');
++    long long ca = 0, ce = 0;
++    int cps = 0;
++    size_t cl = 0;
++    if (std::sscanf(meta.data(), "%lld %lld %d %zu", &ca, &ce, &cps, &cl) != 4) { err = "segcompose: bad meta"; return false; }
++    const int64_t n = e - a, D = a - ca;
++    if (ce - ca != n || cps != page_size || cl != layers.size() || a % 4 || e % 4 || D % 4) {
++        err = "segcompose: span mismatch (captured [" + std::to_string(ca) + "," + std::to_string(ce) + "), asked [" +
++              std::to_string(a) + "," + std::to_string(e) + "), both ends must be multiples of 4)";
++        return false;
++    }
++    std::vector<char> hT, hB, hA, hQ, hP;
++    if (!read_file(dir + "/T.f32", hT, err) || !read_file(dir + "/before.f32", hB, err) ||
++        !read_file(dir + "/after.f32", hA, err) || !read_file(dir + "/qsa.bin", hQ, err) || !read_file(dir + "/ple.f32", hP, err))
++        return false;
++    const uint64_t stride = NST + CONV;
++    if (hT.size() != (size_t) n_gdn * NST * 4 || hB.size() != (size_t) n_gdn * stride * 4 || hA.size() != hB.size()) {
++        err = "segcompose: GDN file sizes";
++        return false;
++    }
++    float *dT, *dB, *dA, *dOut;
++    char* dQ;
++    if (!to_dev(hT, &dT, err) || !to_dev(hB, &dB, err) || !to_dev(hA, &dA, err) || !to_dev(hQ, &dQ, err) ||
++        !ok(cudaMalloc(&dOut, (size_t) n_gdn * NST * 4), "malloc", err))
++        return false;
++    cudaEventRecord(t0);
++    // 1. GDN recurrent state + conv rows
++    const uint64_t tot = (uint64_t) n_gdn * NST;
++    gdn_compose<<<(unsigned) ((tot + 255) / 256), 256>>>(dT, dB, dA, gdn_state, dOut, n_gdn, stride, use_t ? 1 : 0);
++    for (int64_t l = 0; l < n_gdn; ++l) {
++        cudaMemcpy(gdn_state + l * stride, dOut + l * NST, NST * 4, cudaMemcpyDeviceToDevice);
++        cudaMemcpy(gdn_state + l * stride + NST, dA + l * stride + NST, CONV * 4, cudaMemcpyDeviceToDevice);
++    }
++    // 2. QSA layers: K/V cells and pooled indexer rows
++    const size_t codes = (size_t) n * NKV * HD, scales = (size_t) n * NKV * NG, pooled = (size_t) (n / 4) * IDX * 4;
++    size_t off = 0;
++    for (const SegQsa& q : layers) {
++        const char* p = dQ + off;
++        // the spare slot (constant for the sequence) moves from row a/4 to row e/4 before the block rows are written
++        cudaMemcpy(q.pooled + (size_t) (e / 4) * IDX, q.pooled + (size_t) (a / 4) * IDX, IDX * 4, cudaMemcpyDeviceToDevice);
++        kv_scatter_shift<<<dim3((unsigned) n, NKV), 64>>>(q.k_q, q.v_q, q.k_scale, q.v_scale, q.page_table, page_size, a,
++                                                           (const int8_t*) p, (const int8_t*) (p + codes),
++                                                           (const uint16_t*) (p + 2 * codes),
++                                                           (const uint16_t*) (p + 2 * codes + scales * 2), q.cos_tab,
++                                                           q.sin_tab, D);
++        pooled_shift<<<(unsigned) (n / 4), IDX>>>(q.pooled, a / 4, (const float*) (p + 2 * codes + 4 * scales), n / 4,
++                                                  q.cos_tab, q.sin_tab, D);
++        off += 2 * codes + 4 * scales + pooled;
++    }
++    // 3. PLE history at the span's end
++    if (ple_floats && hP.size() == ple_floats * 4)
++        cudaMemcpy(ple_hist, hP.data(), hP.size(), cudaMemcpyHostToDevice);
++    cudaEventRecord(t1);
++    const bool good = ok(cudaDeviceSynchronize(), "compose", err);
++    float f = 0;
++    cudaEventElapsedTime(&f, t0, t1);
++    if (ms) *ms = f;
++    cudaFree(dT); cudaFree(dB); cudaFree(dA); cudaFree(dOut); cudaFree(dQ);
++    cudaEventDestroy(t0);
++    cudaEventDestroy(t1);
++    return good;
++}
++
++}  // namespace strata::prefill
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index 08273c35c..3412ace8f 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -104,6 +104,7 @@
+ #include "strata/core/draft_cap.hpp"
+ #endif
+ #include "strata/prefill/gemm.hpp"
++#include "strata/prefill/segcap.hpp"   // F1: file state capture
+ #include "strata/prefill/kva.hpp"
+ #include "strata/prefill/kva_floor.hpp"
+ #include "strata/prefill/prefill.hpp"
+@@ -17739,6 +17740,10 @@ int main(int argc, char** argv) {
+             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
+             // branch it leaves: N queries cost one prefix, not N.  Absent = as before.
+             int64_t req_pin = 0;
++            int64_t req_seg_a = -1, req_seg_b = -1;   // F1: seg=A:B, capture the span's GDN operator
++            int64_t req_segc_a = -1, req_segc_b = -1;   // F1.3: segc=A:E, compose the captured span there
++            std::vector<std::pair<int64_t, int64_t>> req_segcs;   // F1.5: segc=a:e,a:e,... (span k from $STRATA_SEGCOMP_DIR/k)
++            bool req_segc_not = false;   // F1.5: segc_not=1 composes without T (S0 only)
+             // hold=N:ID (the server's thinking budget, GEN only): end the request after N emitted tokens unless token ID
+             // (</think>) came first, with the session at exactly what was emitted (serve_hold_remaining); DONE says "hold".
+             // Absent = as before.  An older engine skips the key (unknown keys are skipped), and says no "hold" in READY.
+@@ -17776,6 +17781,31 @@ int main(int argc, char** argv) {
+                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                     else if (key == "prefill") req_prefill_only = std::atoi(tok.c_str() + eq + 1) != 0;
+                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
++                    else if (key == "segc") {   // F1.3 / F1.5: one or more spans a:e,a:e
++                        const std::string list = tok.substr(eq + 1);
++                        size_t p0 = 0;
++                        while (p0 <= list.size()) {
++                            const size_t c = list.find(',', p0);
++                            long long sa = -1, sb = -1;
++                            if (std::sscanf(list.substr(p0, c == std::string::npos ? std::string::npos : c - p0).c_str(),
++                                            "%lld:%lld", &sa, &sb) == 2 && sa >= 0 && sb > sa)
++                                req_segcs.push_back({sa, sb});
++                            if (c == std::string::npos) break;
++                            p0 = c + 1;
++                        }
++                        if (!req_segcs.empty()) {
++                            req_segc_a = req_segcs.front().first;
++                            req_segc_b = req_segcs.back().second;
++                        }
++                    }
++                    else if (key == "segc_not") req_segc_not = std::atoi(tok.c_str() + eq + 1) != 0;   // F1.5
++                    else if (key == "seg") {   // F1
++                        long long sa = -1, sb = -1;
++                        if (std::sscanf(tok.c_str() + eq + 1, "%lld:%lld", &sa, &sb) == 2 && sa >= 0 && sb > sa) {
++                            req_seg_a = sa;
++                            req_seg_b = sb;
++                        }
++                    }
+                     else if (key == "hold") {
+                         char* he = nullptr;
+                         const long long hn = std::strtoll(tok.c_str() + eq + 1, &he, 10);
+@@ -20316,6 +20346,29 @@ int main(int argc, char** argv) {
+                 cuts.push_back(pin_at);
+                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
+             }
++            // F1: seg=A:B reads [A, B) as its own batched part, with the GDN operator captured over it
++            const bool seg_on = req_seg_a > read_from && req_seg_b > req_seg_a && req_seg_b < n - 1;
++            if (req_seg_a >= 0 && !seg_on)
++                std::fprintf(stderr, "strata serve: seg=%lld:%lld ignored (prompt read from %lld, %lld tokens)\n",
++                             (long long) req_seg_a, (long long) req_seg_b, (long long) read_from, (long long) n);
++            if (seg_on) {
++                cuts.push_back(req_seg_a);
++                cuts.push_back(req_seg_b);
++                std::sort(cuts.begin(), cuts.end());
++            }
++            // F1.3: segc=A:E composes the captured span over [A, E) instead of reading it
++            const bool segc_on = req_segc_a > read_from && req_segc_b > req_segc_a && req_segc_b < n - 1;
++            if (req_segc_a >= 0 && !segc_on)
++                std::fprintf(stderr, "strata serve: segc=%lld:%lld ignored (prompt read from %lld, %lld tokens)\n",
++                             (long long) req_segc_a, (long long) req_segc_b, (long long) read_from, (long long) n);
++            if (segc_on) {
++                for (const auto& sp2 : req_segcs) {
++                    cuts.push_back(sp2.first);
++                    cuts.push_back(sp2.second);
++                }
++                std::sort(cuts.begin(), cuts.end());
++                cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
++            }
+             int64_t at = read_from;
+             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
+             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
+@@ -20343,7 +20396,13 @@ int main(int argc, char** argv) {
+             for (const int64_t to : cuts) {
+                 if (to <= at) continue;
+                 err.clear();
+-                const bool win = windows_ok(at, to);
++                const bool seg_part = seg_on && at == req_seg_a && to == req_seg_b;   // F1
++                int segc_k = -1;   // F1.5: which composed span this part is
++                if (segc_on)
++                    for (size_t k = 0; k < req_segcs.size(); ++k)
++                        if (at == req_segcs[k].first && to == req_segcs[k].second) segc_k = (int) k;
++                const bool segc_part = segc_k >= 0;   // F1.3
++                const bool win = !seg_part && !segc_part && windows_ok(at, to);
+                 if (win && !refill(err)) {
+                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                     return 1;
+@@ -20358,10 +20417,80 @@ int main(int argc, char** argv) {
+                 }
+                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
+                 const int64_t read_to = merge_at >= 0 ? merge_at : to;   // (merge_at > at: the part's windows before it)
++                if (seg_part) {   // F1: the state before the span, then the operator capture
++                    const char* sdir = std::getenv("STRATA_SEGCAP_DIR");
++                    std::string se;
++                    const uint64_t gf = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
++                    if (sdir == nullptr || !strata::prefill::segcap_dump(ss.gdn_state, gf * (uint64_t) ss.gdn_alloc,
++                                                                         std::string(sdir) + "/before.f32", se) ||
++                        !strata::prefill::segcap_begin(ss.gdn_alloc, std::min<int64_t>(to - at, 16384), se))
++                        std::fprintf(stderr, "strata serve: seg capture not started: %s\n",
++                                     sdir ? se.c_str() : "STRATA_SEGCAP_DIR is not set");
++                }
+                 const auto tsp = Clock::now();
+                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
+-                const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
++                bool segc_done = false;
++                if (segc_part) {   // F1.3: compose the captured span instead of reading it; on any failure, read it
++                    auto seg_qsa = [&]() {   // F1: this session's QSA layers (INT8 K/V, every page resident)
++                        std::vector<strata::prefill::SegQsa> v;
++                        for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
++                            const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
++                            if (!st.kv_int8 || st.kv_mode != 0) return std::vector<strata::prefill::SegQsa>{};
++                            v.push_back({st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.idx_pooled,
++                                         st.cos_tab, st.sin_tab});
++                        }
++                        return v;
++                    };
++                    const char* cdir = std::getenv("STRATA_SEGCOMP_DIR");
++                    std::string se;
++                    double cms = 0.0;
++                    const auto q = seg_qsa();
++                    const auto tc0 = Clock::now();
++                    const std::string cdir_k = cdir == nullptr ? std::string()
++                                               : (req_segcs.size() > 1 ? std::string(cdir) + "/" + std::to_string(segc_k)
++                                                                       : std::string(cdir));
++                    segc_done = cdir != nullptr && !q.empty() && ss.ple_hist != nullptr &&
++                                strata::prefill::segcomp_apply(cdir_k, at, to, ss.gdn_state, ss.gdn_alloc, q,
++                                                               (int) strata::kernels::qsa_real_shapes().page_size,
++                                                               ss.ple_hist, (uint64_t) 9 * 10240, &cms, se, !req_segc_not);
++                    if (segc_done) {
++                        ss.ple_prev[0] = (int32_t) ids[(size_t) to - 2];
++                        ss.ple_prev[1] = (int32_t) ids[(size_t) to - 1];
++                    }
++                    std::fprintf(stderr, "strata serve: segc compose [%lld, %lld): %s (GPU %.1f ms, wall %.1f ms)\n",
++                                 (long long) at, (long long) to, segc_done ? "done" : (cdir ? se.c_str() : "STRATA_SEGCOMP_DIR unset"),
++                                 cms, std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
++                }
++                const bool sp_ok = segc_done || read_to <= at ||
++                                   (win ? read_windows(at, read_to, err) : read_part(at, to, err));
+                 if (sp_ok) pp_exact = true;
++                if (seg_part && strata::prefill::segcap().active) {   // F1: the operator and the state after the span
++                    const char* sdir = std::getenv("STRATA_SEGCAP_DIR");
++                    std::string se;
++                    const uint64_t gf = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
++                    const bool w0 = sp_ok && strata::prefill::segcap_end(std::string(sdir) + "/T.f32", se) &&
++                                    strata::prefill::segcap_dump(ss.gdn_state, gf * (uint64_t) ss.gdn_alloc,
++                                                                 std::string(sdir) + "/after.f32", se);
++                    auto seg_qsa = [&]() {   // F1: this session's QSA layers (INT8 K/V, every page resident)
++                        std::vector<strata::prefill::SegQsa> v;
++                        for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
++                            const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
++                            if (!st.kv_int8 || st.kv_mode != 0) return std::vector<strata::prefill::SegQsa>{};
++                            v.push_back({st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.idx_pooled,
++                                         st.cos_tab, st.sin_tab});
++                        }
++                        return v;
++                    };
++                    const auto q = seg_qsa();
++                    const bool w = w0 && !q.empty() && ss.ple_hist != nullptr && at % 4 == 0 && to % 4 == 0 &&
++                                   strata::prefill::segcap_save_qsa(q, (int) strata::kernels::qsa_real_shapes().page_size, at, to,
++                                                                    ss.ple_hist, (uint64_t) 9 * 10240, sdir, se);
++                    if (w0 && !w && se.empty()) se = "QSA part not saved (INT8 resident K/V and both ends on a multiple of 4 needed)";
++                    if (!sp_ok) strata::prefill::segcap().active = false;
++                    std::fprintf(stderr, "strata serve: seg capture [%lld, %lld): %s (%lld layer calls, %lld tokens)\n",
++                                 (long long) at, (long long) to, w ? "written" : (sp_ok ? se.c_str() : "read failed"),
++                                 (long long) strata::prefill::segcap().calls, (long long) strata::prefill::segcap().tokens);
++                }
+                 if (trace) {
+                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
+                     (win ? req_times.windows_ms : req_times.read_ms) += ms;
+diff --git a/terminal/serve/server.py b/terminal/serve/server.py
+index b91f8bf05..49c7238f4 100644
+--- a/terminal/serve/server.py
++++ b/terminal/serve/server.py
+@@ -1306,6 +1306,17 @@ class StrataEngine:
+         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
+         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
+         prefix = sampling.get("strata_prefix")
++        # F1 (research): "strata_seg" resolved by Service.resolve_segment to {"tokens": [A, B]}: capture that span
++        seg = sampling.get("strata_seg")
++        if isinstance(seg, dict) and isinstance(seg.get("tokens"), list) and len(seg["tokens"]) == 2:
++            keys += f" seg={int(seg['tokens'][0])}:{int(seg['tokens'][1])}"
++        segc = sampling.get("strata_segc")   # F1.3: compose the captured span(s) at these tokens
++        if isinstance(segc, dict) and isinstance(segc.get("tokens"), list) and len(segc["tokens"]) == 2:
++            keys += f" segc={int(segc['tokens'][0])}:{int(segc['tokens'][1])}"
++        elif isinstance(segc, dict) and isinstance(segc.get("spans"), list) and segc["spans"]:   # F1.5: several spans
++            keys += " segc=" + ",".join(f"{int(a)}:{int(e)}" for a, e in segc["spans"])
++        if sampling.get("strata_segc_not"):   # F1.5: compose without T
++            keys += " segc_not=1"
+         if isinstance(prefix, dict):
+             pn = prefix.get("tokens")
+             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
+@@ -5094,6 +5105,10 @@ class Service:
+             write_temporary(combined, [p for p, _ in encoded])
+         if req is not None and req.get("strata_prefix") is not None:
+             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
++        if req is not None and req.get("strata_seg") is not None:   # F1 (research)
++            req["strata_seg"] = self.resolve_segment(req["strata_seg"], messages, tools, kwargs, ids, bool(images))
++        if req is not None and req.get("strata_segc") is not None:   # F1.3 (research)
++            req["strata_segc"] = self.resolve_segment(req["strata_segc"], messages, tools, kwargs, ids, bool(images))
+         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+ 
+     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
+@@ -5170,6 +5185,27 @@ class Service:
+             return {}
+         return {"tokens": n}
+ 
++    def resolve_segment(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
++        """F1 (research): {"message": I, "start": c0, "end": c1} -> {"tokens": [A, B]}, the token span of characters
++        [c0, c1) of message I in the rendered prompt (the same resolution as strata_prefix's message/chars)."""
++        if isinstance(spec, dict) and isinstance(spec.get("tokens"), list) and len(spec["tokens"]) == 2:
++            return {"tokens": [int(spec["tokens"][0]), int(spec["tokens"][1])]}   # explicit token span (aligned by the client)
++        if isinstance(spec, dict) and isinstance(spec.get("spans"), list):   # F1.5: explicit spans, passed through
++            return {"spans": [[int(a), int(e)] for a, e in spec["spans"]]}
++        if isinstance(spec, dict) and isinstance(spec.get("segments"), list):   # F1.5 dry run: several char spans
++            return {"segments": [self.resolve_segment(x, messages, tools, kwargs, ids, has_images) for x in spec["segments"]]}
++        try:
++            i, c0, c1 = int(spec["message"]), int(spec["start"]), int(spec["end"])
++        except Exception:
++            raise ValueError('strata_seg: {"message": I, "start": c0, "end": c1}')
++        a = self.resolve_prefix({"message": i, "chars": max(1, c0)}, messages, tools, kwargs, ids, has_images)
++        b = self.resolve_prefix({"message": i, "chars": c1}, messages, tools, kwargs, ids, has_images)
++        if not a or not b or b["tokens"] <= a["tokens"]:
++            print(f"[strata] strata_seg ignored: {spec} -> {a} {b}", flush=True)
++            return {}
++        print(f"[strata] strata_seg: chars [{c0}, {c1}) of message {i} = tokens [{a['tokens']}, {b['tokens']})", flush=True)
++        return {"tokens": [a["tokens"], b["tokens"]]}
++
+     def drop_embeddings(self) -> None:
+         """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
+         ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
+@@ -7452,6 +7488,9 @@ def make_handler(svc: Service):
+             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
++            if req.get("strata_dry"):   # F1 (research): the resolved prompt only, no engine run
++                return self._json(200, {"prompt_tokens": len(ids), "strata_seg": req.get("strata_seg"),
++                                        "strata_segc": req.get("strata_segc")})
+             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                {t["name"] for t in extra}) if use_mcp else None
+             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+-- 
+2.43.0
+

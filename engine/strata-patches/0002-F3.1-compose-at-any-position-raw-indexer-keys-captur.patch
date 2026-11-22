@@ -1,0 +1,317 @@
+From 0756168e42381701b3ae59d8a345e468c5383e2f Mon Sep 17 00:00:00 2001
+From: f1-research <f1@localhost>
+Date: Sun, 22 Nov 2026 09:18:54 +0000
+Subject: [PATCH 2/5] F3.1: compose at any position (raw indexer keys captured,
+ re-pooled with the engine batched append at load)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LHC9HuRHHgU5cu8SqUTYdk
+---
+ engine/include/strata/prefill/segcap.hpp | 30 ++++++++---
+ engine/src/prefill/prefill.cpp           |  4 ++
+ engine/src/prefill/segcap.cpp            | 39 ++++++++++++++-
+ engine/src/prefill/segcompose.cu         | 63 ++++++++++++++++++------
+ engine/src/program/generate.cpp          |  8 +--
+ 5 files changed, 117 insertions(+), 27 deletions(-)
+
+diff --git a/engine/include/strata/prefill/segcap.hpp b/engine/include/strata/prefill/segcap.hpp
+index df518daee..207d87863 100644
+--- a/engine/include/strata/prefill/segcap.hpp
++++ b/engine/include/strata/prefill/segcap.hpp
+@@ -22,12 +22,25 @@ struct SegCap {
+     int64_t calls = 0;          ///< segcap_layer calls since segcap_begin (36 x chunks expected)
+     int64_t tokens = 0;         ///< tokens seen by GDN layer 0 since segcap_begin
+     bool overflow = false;      ///< a chunk was larger than max_t: the capture is invalid
++    // F3.1: the span's RAW indexer keys per QSA layer, so a load can re-pool them at ANY position (no mod-4 rule)
++    int64_t n_qsa = 0;          ///< QSA layers kept (the session's qsa_alloc)
++    int64_t span_a = 0;         ///< first token of the captured span
++    int64_t span_n = 0;         ///< tokens in the span
++    int64_t raw_cap = 0;        ///< floats allocated in `raw`
++    float* raw = nullptr;       ///< (n_qsa, span_n, 128) fp32: never normed, never rotated (qsa.hpp)
++    int64_t raw_rows = 0;       ///< rows written (n_qsa x span_n expected)
+ };
+ 
+ SegCap& segcap();
+ 
+ /// Allocates (once, grow-only) and sets every layer's operator to the identity. max_t: the largest chunk expected.
+-bool segcap_begin(int64_t n_gdn, int64_t max_t, std::string& err);
++/// n_qsa / a / n: the QSA layers and the span whose raw indexer keys are kept (n_qsa 0: none).
++bool segcap_begin(int64_t n_gdn, int64_t max_t, std::string& err, int64_t n_qsa = 0, int64_t a = 0, int64_t n = 0);
++/// One QSA layer's chunk [p0, p0 + T): copies the rows inside the span from `idx_raw` (T x 128 fp32).
++void segcap_qsa_raw(int64_t qsa_ord, const float* idx_raw, int64_t p0, int64_t T, void* stream);
++/// The indexer k_norm weight of each QSA layer (session ordinal), recorded by every prompt read: a load needs it.
++void segcap_register_knorm(int64_t qsa_ord, const float* w);
++const float* segcap_knorm(int64_t qsa_ord);
+ /// One GDN layer's chunk: copies h, zeroes its v columns and runs the state-only recurrence into T[gdn_ord].
+ void segcap_layer(int64_t gdn_ord, const float* h, const float* gate, const float* beta, int64_t T, void* stream);
+ /// Synchronizes, writes T (n_gdn x layer floats) to `path`, turns the capture off.
+@@ -45,15 +58,20 @@ struct SegQsa {
+     float* pooled;
+     const float* cos_tab;
+     const float* sin_tab;
++    float* idx_tail;            ///< F3.1: the indexer's running state, for the re-pooling append at load
++    float* idx_dead;
++    int32_t* idx_block_pos;
++    int64_t max_cells;
+ };
+ 
+-/// F1.3 capture, at the span's end: the span's K/V cells and scales, its pooled indexer rows (both ends multiples of 4)
+-/// and the PLE history, to dir/qsa.bin, dir/ple.f32, dir/meta.txt.
++/// F1.3/F3.1 capture, at the span's end: the span's K/V cells and scales, its RAW indexer keys (segcap().raw) and the
++/// PLE history, to dir/qsa.bin, dir/ple.f32, dir/meta.txt.  Any span ends (no mod-4 rule).
+ bool segcap_save_qsa(const std::vector<SegQsa>& layers, int page_size, int64_t a, int64_t e, const float* ple_hist,
+                      uint64_t ple_floats, const std::string& dir, std::string& err);
+-/// F1.3 compose: instead of reading [a, e), set the GDN state to W_after + T (W - W_before) (conv rows: the capture's),
+-/// write the captured K/V into cells [a, e) re-rotated by a - captured_a, the pooled rows likewise (the spare slot moved
+-/// to row e/4), and the PLE history.  The caller sets ple_prev.  `ms`: GPU time of the composition.
++/// F1.3/F3.1 compose: instead of reading [a, e), set the GDN state to W_after + T (W - W_before) (conv rows: the
++/// capture's), write the captured K/V into cells [a, e) re-rotated by a - captured_a (any shift), append the captured raw
++/// indexer keys at [a, e) (the engine's own batched append: blocks pooled exactly as a read would, at any alignment), and
++/// the PLE history.  The caller sets ple_prev.  `ms`: GPU time of the composition.
+ bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_state, int64_t n_gdn,
+                    const std::vector<SegQsa>& layers, int page_size, float* ple_hist, uint64_t ple_floats, double* ms,
+                    std::string& err, bool use_t = true);
+diff --git a/engine/src/prefill/prefill.cpp b/engine/src/prefill/prefill.cpp
+index d697ff6af..5b61d2c9f 100644
+--- a/engine/src/prefill/prefill.cpp
++++ b/engine/src/prefill/prefill.cpp
+@@ -5102,6 +5102,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                                                                        strata::kernels::rope_scaling(), m.cs);
+                         }
+                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
++                    strata::prefill::segcap_register_knorm(qsa_index - ss.qsa_ord0, (const float*) wikn->data);   // F3.1
++                    if (strata::prefill::segcap().active) strata::prefill::segcap_qsa_raw(qsa_index - ss.qsa_ord0, m.idx_raw, p0, T, m.cs);
+                     // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that
+                     // reads them (query side, selection, attention, output projection, the MoE half) has a
+                     // consumer left, so the layer ends here.
+@@ -8807,6 +8809,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
+                                                                            strata::kernels::rope_scaling(), cs);
+                             }
+                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
++                        strata::prefill::segcap_register_knorm(qsa_index - ssp->qsa_ord0, (const float*) wikn->data);   // F3.1
++                        if (strata::prefill::segcap().active) strata::prefill::segcap_qsa_raw(qsa_index - ssp->qsa_ord0, m.idx_raw, p0, T, cs);
+                         pt.mark(kPfQsaSel, cs);
+                         for (int64_t q0 = 0; q0 < T; q0 += m.sel_batch) {
+                             const int64_t nb = std::min(m.sel_batch, T - q0);
+diff --git a/engine/src/prefill/segcap.cpp b/engine/src/prefill/segcap.cpp
+index 4d484db7d..0a4584173 100644
+--- a/engine/src/prefill/segcap.cpp
++++ b/engine/src/prefill/segcap.cpp
+@@ -2,6 +2,7 @@
+ #include "strata/prefill/segcap.hpp"
+ #include "strata/prefill/kernels.hpp"
+ #include <cuda_runtime.h>
++#include <algorithm>
+ #include <cstdio>
+ #include <vector>
+ #if defined(cudaMemsetAsync) && !defined(cudaMemset2DAsync)   // the HIP build maps cuda* names by macro
+@@ -37,8 +38,44 @@ SegCap& segcap() {
+     return s;
+ }
+ 
+-bool segcap_begin(int64_t n_gdn, int64_t max_t, std::string& err) {
++namespace {
++const float* g_knorm[64] = {};
++}
++
++void segcap_register_knorm(int64_t qsa_ord, const float* w) {
++    if (qsa_ord >= 0 && qsa_ord < 64) g_knorm[qsa_ord] = w;
++}
++
++const float* segcap_knorm(int64_t qsa_ord) {
++    return qsa_ord >= 0 && qsa_ord < 64 ? g_knorm[qsa_ord] : nullptr;
++}
++
++void segcap_qsa_raw(int64_t qsa_ord, const float* idx_raw, int64_t p0, int64_t T, void* stream) {
+     SegCap& s = segcap();
++    if (!s.active || s.raw == nullptr || qsa_ord < 0 || qsa_ord >= s.n_qsa) return;
++    const int64_t lo = std::max(p0, s.span_a), hi = std::min(p0 + T, s.span_a + s.span_n);
++    if (hi <= lo) return;
++    cudaMemcpyAsync(s.raw + ((size_t) qsa_ord * s.span_n + (lo - s.span_a)) * 128, idx_raw + (size_t) (lo - p0) * 128,
++                    (size_t) (hi - lo) * 128 * sizeof(float), cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
++    s.raw_rows += hi - lo;
++}
++
++bool segcap_begin(int64_t n_gdn, int64_t max_t, std::string& err, int64_t n_qsa, int64_t a, int64_t n) {
++    SegCap& s = segcap();
++    s.n_qsa = s.span_n = s.raw_rows = 0;
++    if (n_qsa > 0 && n > 0) {
++        const int64_t need = n_qsa * n * 128;
++        if (need > s.raw_cap) {
++            if (s.raw) cudaFree(s.raw);
++            s.raw = nullptr;
++            s.raw_cap = 0;
++            if (!ok(cudaMalloc(&s.raw, (size_t) need * sizeof(float)), "raw", err)) return false;
++            s.raw_cap = need;
++        }
++        s.n_qsa = n_qsa;
++        s.span_a = a;
++        s.span_n = n;
++    }
+     if (n_gdn <= 0 || max_t <= 0) {
+         err = "segcap: nothing to capture";
+         return false;
+diff --git a/engine/src/prefill/segcompose.cu b/engine/src/prefill/segcompose.cu
+index 3d5fe0e2c..c0a2f70e7 100644
+--- a/engine/src/prefill/segcompose.cu
++++ b/engine/src/prefill/segcompose.cu
+@@ -5,11 +5,16 @@
+ // [head_dim/64] fp16 bits; cell t -> page = page_table[t / page_size].  Keys are stored AFTER RoPE (NEOX: dim i pairs
+ // with i + n_rot/2 inside the first n_rot dims); with n_rot = 64 the rotated slice is exactly scale group 0, so a shift
+ // by D re-rotates that group (dequantise, rotate by D, requantise) and leaves groups 1..3 and all of V untouched.
+-// Pooled indexer keys: fp32 rows of idx_dim, block b rotated at the block's first cell, same pairing.
++// Indexer (F3.1): the span's RAW keys are stored and re-appended at load with the engine's batched append, so the
++// blocks are pooled exactly as a read at the new position would pool them, whatever the position modulo 4.
+ #include "strata/prefill/segcap.hpp"
++#include "strata/kernels/native_qsa_indexer.hpp"
++#include "strata/kernels/qsa.hpp"
++#include "strata/kernels/rope_scaling.hpp"
+ #include <cuda_runtime.h>
+ #include <cuda_fp16.h>
+ #include <cmath>
++#include <exception>
+ #include <cstdio>
+ #include <vector>
+ 
+@@ -172,22 +177,30 @@ bool segcap_save_qsa(const std::vector<SegQsa>& layers, int page_size, int64_t a
+     if (!ok(cudaMalloc(&dk, codes), "malloc", err) || !ok(cudaMalloc(&dv, codes), "malloc", err) ||
+         !ok(cudaMalloc(&dks, scales * 2), "malloc", err) || !ok(cudaMalloc(&dvs, scales * 2), "malloc", err))
+         return false;
+-    const int64_t b0 = a / 4, b1 = e / 4;
++    const SegCap& sc = segcap();
++    if (sc.span_a != a || sc.span_n != n || sc.n_qsa != (int64_t) layers.size() || sc.raw == nullptr ||
++        sc.raw_rows != sc.n_qsa * n) {
++        err = "segcompose: raw indexer keys not captured for [" + std::to_string(a) + "," + std::to_string(e) + ") (rows " +
++              std::to_string(sc.raw_rows) + ")";
++        return false;
++    }
++    size_t layer_j = 0;
+     for (const SegQsa& q : layers) {
+         kv_gather<<<dim3((unsigned) n, NKV), 64>>>(q.k_q, q.v_q, q.k_scale, q.v_scale, q.page_table, page_size, a, dk, dv,
+                                                     dks, dvs);
+         if (!ok(cudaDeviceSynchronize(), "gather", err)) return false;
+         const size_t off = blob.size();
+-        const size_t pooled = (size_t) (b1 - b0) * IDX * sizeof(float);
+-        blob.resize(off + 2 * codes + 2 * scales * 2 + pooled);
++        const size_t raw = (size_t) n * IDX * sizeof(float);
++        blob.resize(off + 2 * codes + 2 * scales * 2 + raw);
+         char* p = blob.data() + off;
+         if (!ok(cudaMemcpy(p, dk, codes, cudaMemcpyDeviceToHost), "D2H", err) ||
+             !ok(cudaMemcpy(p + codes, dv, codes, cudaMemcpyDeviceToHost), "D2H", err) ||
+             !ok(cudaMemcpy(p + 2 * codes, dks, scales * 2, cudaMemcpyDeviceToHost), "D2H", err) ||
+             !ok(cudaMemcpy(p + 2 * codes + scales * 2, dvs, scales * 2, cudaMemcpyDeviceToHost), "D2H", err) ||
+-            !ok(cudaMemcpy(p + 2 * codes + 4 * scales, q.pooled + (size_t) b0 * IDX, pooled, cudaMemcpyDeviceToHost), "D2H",
+-                err))
++            !ok(cudaMemcpy(p + 2 * codes + 4 * scales, sc.raw + layer_j * (size_t) n * IDX, raw, cudaMemcpyDeviceToHost),
++                "D2H", err))
+             return false;
++        ++layer_j;
+     }
+     cudaFree(dk); cudaFree(dv); cudaFree(dks); cudaFree(dvs);
+     std::vector<float> ple((size_t) ple_floats);
+@@ -215,11 +228,16 @@ bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_stat
+     size_t cl = 0;
+     if (std::sscanf(meta.data(), "%lld %lld %d %zu", &ca, &ce, &cps, &cl) != 4) { err = "segcompose: bad meta"; return false; }
+     const int64_t n = e - a, D = a - ca;
+-    if (ce - ca != n || cps != page_size || cl != layers.size() || a % 4 || e % 4 || D % 4) {
++    if (ce - ca != n || cps != page_size || cl != layers.size()) {
+         err = "segcompose: span mismatch (captured [" + std::to_string(ca) + "," + std::to_string(ce) + "), asked [" +
+-              std::to_string(a) + "," + std::to_string(e) + "), both ends must be multiples of 4)";
++              std::to_string(a) + "," + std::to_string(e) + "))";
+         return false;
+     }
++    for (size_t j = 0; j < layers.size(); ++j)
++        if (segcap_knorm((int64_t) j) == nullptr) {
++            err = "segcompose: indexer k_norm weights not registered yet (no prompt read since the engine started)";
++            return false;
++        }
+     std::vector<char> hT, hB, hA, hQ, hP;
+     if (!read_file(dir + "/T.f32", hT, err) || !read_file(dir + "/before.f32", hB, err) ||
+         !read_file(dir + "/after.f32", hA, err) || !read_file(dir + "/qsa.bin", hQ, err) || !read_file(dir + "/ple.f32", hP, err))
+@@ -242,22 +260,35 @@ bool segcomp_apply(const std::string& dir, int64_t a, int64_t e, float* gdn_stat
+         cudaMemcpy(gdn_state + l * stride, dOut + l * NST, NST * 4, cudaMemcpyDeviceToDevice);
+         cudaMemcpy(gdn_state + l * stride + NST, dA + l * stride + NST, CONV * 4, cudaMemcpyDeviceToDevice);
+     }
+-    // 2. QSA layers: K/V cells and pooled indexer rows
+-    const size_t codes = (size_t) n * NKV * HD, scales = (size_t) n * NKV * NG, pooled = (size_t) (n / 4) * IDX * 4;
++    // 2. QSA layers: K/V cells (keys re-rotated by D), then the raw indexer keys appended at [a, e)
++    const size_t codes = (size_t) n * NKV * HD, scales = (size_t) n * NKV * NG, raw = (size_t) n * IDX * 4;
++    cudaStream_t ist = nullptr;
++    if (!ok(cudaStreamCreate(&ist), "stream", err)) return false;
+     size_t off = 0;
+-    for (const SegQsa& q : layers) {
++    for (size_t j = 0; j < layers.size(); ++j) {
++        const SegQsa& q = layers[j];
+         const char* p = dQ + off;
+-        // the spare slot (constant for the sequence) moves from row a/4 to row e/4 before the block rows are written
+-        cudaMemcpy(q.pooled + (size_t) (e / 4) * IDX, q.pooled + (size_t) (a / 4) * IDX, IDX * 4, cudaMemcpyDeviceToDevice);
+         kv_scatter_shift<<<dim3((unsigned) n, NKV), 64>>>(q.k_q, q.v_q, q.k_scale, q.v_scale, q.page_table, page_size, a,
+                                                            (const int8_t*) p, (const int8_t*) (p + codes),
+                                                            (const uint16_t*) (p + 2 * codes),
+                                                            (const uint16_t*) (p + 2 * codes + scales * 2), q.cos_tab,
+                                                            q.sin_tab, D);
+-        pooled_shift<<<(unsigned) (n / 4), IDX>>>(q.pooled, a / 4, (const float*) (p + 2 * codes + 4 * scales), n / 4,
+-                                                  q.cos_tab, q.sin_tab, D);
+-        off += 2 * codes + 4 * scales + pooled;
++        cudaDeviceSynchronize();
++        const strata::kernels::QsaIndexerBuffers ib{q.idx_tail, q.idx_dead, q.pooled, q.idx_block_pos};
++        try {
++            strata::kernels::native_qsa_indexer_append_batch((const float*) (p + 2 * codes + 4 * scales), n, a, 0,
++                                                             segcap_knorm((int64_t) j), 1e-6f, ib,
++                                                             strata::kernels::qsa_real_shapes(), q.max_cells,
++                                                             strata::kernels::rope_scaling(), ist);
++        } catch (const std::exception& ex) {
++            err = std::string("segcompose: indexer append: ") + ex.what();
++            cudaStreamDestroy(ist);
++            return false;
++        }
++        cudaStreamSynchronize(ist);
++        off += 2 * codes + 4 * scales + raw;
+     }
++    cudaStreamDestroy(ist);
+     // 3. PLE history at the span's end
+     if (ple_floats && hP.size() == ple_floats * 4)
+         cudaMemcpy(ple_hist, hP.data(), hP.size(), cudaMemcpyHostToDevice);
+diff --git a/engine/src/program/generate.cpp b/engine/src/program/generate.cpp
+index 3412ace8f..ffffa1725 100644
+--- a/engine/src/program/generate.cpp
++++ b/engine/src/program/generate.cpp
+@@ -20423,7 +20423,7 @@ int main(int argc, char** argv) {
+                     const uint64_t gf = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size + (uint64_t) g.ssm_conv_channels * (uint64_t) (g.ssm_d_conv - 1);
+                     if (sdir == nullptr || !strata::prefill::segcap_dump(ss.gdn_state, gf * (uint64_t) ss.gdn_alloc,
+                                                                          std::string(sdir) + "/before.f32", se) ||
+-                        !strata::prefill::segcap_begin(ss.gdn_alloc, std::min<int64_t>(to - at, 16384), se))
++                        !strata::prefill::segcap_begin(ss.gdn_alloc, std::min<int64_t>(to - at, 16384), se, ss.qsa_alloc, at, to - at))
+                         std::fprintf(stderr, "strata serve: seg capture not started: %s\n",
+                                      sdir ? se.c_str() : "STRATA_SEGCAP_DIR is not set");
+                 }
+@@ -20437,7 +20437,7 @@ int main(int argc, char** argv) {
+                             const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
+                             if (!st.kv_int8 || st.kv_mode != 0) return std::vector<strata::prefill::SegQsa>{};
+                             v.push_back({st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.idx_pooled,
+-                                         st.cos_tab, st.sin_tab});
++                                         st.cos_tab, st.sin_tab, st.idx_tail, st.idx_dead, st.idx_block_pos, st.max_cells});
+                         }
+                         return v;
+                     };
+@@ -20477,7 +20477,7 @@ int main(int argc, char** argv) {
+                             const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
+                             if (!st.kv_int8 || st.kv_mode != 0) return std::vector<strata::prefill::SegQsa>{};
+                             v.push_back({st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.idx_pooled,
+-                                         st.cos_tab, st.sin_tab});
++                                         st.cos_tab, st.sin_tab, st.idx_tail, st.idx_dead, st.idx_block_pos, st.max_cells});
+                         }
+                         return v;
+                     };
+@@ -20485,7 +20485,7 @@ int main(int argc, char** argv) {
+                     const bool w = w0 && !q.empty() && ss.ple_hist != nullptr && at % 4 == 0 && to % 4 == 0 &&
+                                    strata::prefill::segcap_save_qsa(q, (int) strata::kernels::qsa_real_shapes().page_size, at, to,
+                                                                     ss.ple_hist, (uint64_t) 9 * 10240, sdir, se);
+-                    if (w0 && !w && se.empty()) se = "QSA part not saved (INT8 resident K/V and both ends on a multiple of 4 needed)";
++                    if (w0 && !w && se.empty()) se = "QSA part not saved (INT8 resident K/V needed)";
+                     if (!sp_ok) strata::prefill::segcap().active = false;
+                     std::fprintf(stderr, "strata serve: seg capture [%lld, %lld): %s (%lld layer calls, %lld tokens)\n",
+                                  (long long) at, (long long) to, w ? "written" : (sp_ok ? se.c_str() : "read failed"),
+-- 
+2.43.0
+
