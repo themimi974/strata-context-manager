@@ -10,7 +10,7 @@ whether the cost is acceptable for your use. It is off by default.
 ## How it works
 
 1. **Gateway.** With `CTX_SEG=1`, the Context Manager looks for tool results of the tools in `CTX_SEG_TOOLS`
-   (default `read_file`) longer than `CTX_SEG_MIN_CHARS` (4000). Each one gets an id:
+   (compose default `read_file,skill_view`: files and Hermes skills) longer than `CTX_SEG_MIN_CHARS` (4000). Each one gets an id:
    `sha256(validity tuple | exact text)`, so a changed file or another model/engine gets a new id. The hook sends
    `strata_segx: {"files": [{message, start, end, id}]}` with the request.
 2. **Strata** (patched, see below) resolves each file to a token span. If `<STRATA_SEGSTORE>/v2-<id>` exists and its

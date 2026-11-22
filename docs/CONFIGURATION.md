@@ -61,7 +61,7 @@ File state cache (research, needs the Strata build with `strata_segx`; see [FILE
 | Variable | Default | Meaning |
 |---|---|---|
 | `CTX_SEG` | `0` | mark file reads in the conversation so Strata stores and reloads their state |
-| `CTX_SEG_TOOLS` | `read_file` | tool names whose results are files (comma list or JSON list) |
+| `CTX_SEG_TOOLS` | `read_file,skill_view` (compose) | tool names whose results are files or skills (comma list or JSON list); Hermes: `read_file`, `skill_view` |
 | `CTX_SEG_MIN_CHARS` | `4000` | smaller tool results are just read |
 
 ## Compose (`deploy/.env`)
