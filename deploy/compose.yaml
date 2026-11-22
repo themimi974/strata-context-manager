@@ -65,6 +65,9 @@ services:
       CTX_SEG: ${CTX_SEG:-0}                 # file state cache: needs the Strata research build (strata_segx)
       CTX_SEG_TOOLS: ${CTX_SEG_TOOLS:-read_file,skill_view}
       CTX_SEG_MIN_CHARS: ${CTX_SEG_MIN_CHARS:-4000}
+      CTX_SEG_TERMINAL: ${CTX_SEG_TERMINAL:-}               # reads made with the shell tool: cat, slice, or cat,slice (default off)
+      CTX_SEG_TERMINAL_TOOLS: ${CTX_SEG_TERMINAL_TOOLS:-terminal}
+      CTX_SEG_SLICE_MIN_CHARS: ${CTX_SEG_SLICE_MIN_CHARS:-3000}
       CTX_RECORD: ${CTX_RECORD:-}             # benchmark: e.g. /bench/requests.jsonl (mount a folder below)
     # volumes:
     #   - ./bench-data:/bench

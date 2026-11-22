@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from . import policy
 from .blocks import Validity, chain, request_blocks
 from .canon import move_volatile_lines
-from .segments import engine_spec, file_segments, tools_from_env
+from .segments import engine_spec, file_segments, terminal_modes_from_env, tools_from_env
 from .engine import StrataAdapter
 
 MODE = os.environ.get("CTX_MODE", "passthrough")
@@ -58,6 +58,9 @@ PIN_MIN_TOKENS = int(os.environ.get("CTX_PIN_MIN_TOKENS", "2048"))
 SEG = os.environ.get("CTX_SEG", "0") == "1"                     # file state cache (Strata research build): strata_segx
 SEG_TOOLS = tools_from_env(os.environ.get("CTX_SEG_TOOLS"))      # tools whose results are files (default read_file)
 SEG_MIN_CHARS = int(os.environ.get("CTX_SEG_MIN_CHARS", "4000"))  # smaller results are cheaper to read than to load
+SEG_TERMINAL = terminal_modes_from_env(os.environ.get("CTX_SEG_TERMINAL"))   # reads made with a shell tool: cat, slice (off by default)
+SEG_TERMINAL_TOOLS = tools_from_env(os.environ.get("CTX_SEG_TERMINAL_TOOLS") or "terminal")   # the shell tool's name (Hermes: terminal)
+SEG_SLICE_MIN_CHARS = int(os.environ.get("CTX_SEG_SLICE_MIN_CHARS", "3000"))   # a stored slice costs ~70 MB: only big ones pay
 RECORD = os.environ.get("CTX_RECORD", "")                       # benchmark: append every request (as sent) here
 PIN_WINDOW_H = float(os.environ.get("CTX_PIN_WINDOW_H", "6"))   # pin the most requested head over this window
 
@@ -193,7 +196,7 @@ async def observe(o: Observe):
             await c.execute("UPDATE request_log SET pinned = $2 WHERE id = $1", rid, pin is not None)
     segx = None
     if SEG:   # F4: every file read in the request, named by its exact content; Strata loads or stores each one
-        segs = file_segments(o.messages, VALIDITY.root(), SEG_TOOLS, SEG_MIN_CHARS)
+        segs = file_segments(o.messages, VALIDITY.root(), SEG_TOOLS, SEG_MIN_CHARS, SEG_TERMINAL, SEG_TERMINAL_TOOLS, SEG_SLICE_MIN_CHARS)
         if segs:
             segx = engine_spec(segs)
             async with pool.acquire() as c:

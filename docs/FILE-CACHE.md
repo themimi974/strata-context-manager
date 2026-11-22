@@ -48,6 +48,30 @@ normal read again with only a hidden nonce changed (engine noise), and loaded fr
 | First read of a file | about +25 % prompt-reading time (the capture) |
 | Budget | `strata-segments-janitor` keeps the store under `SEG_BUDGET_GB` (40), least recently used first |
 
+## Reads made with a shell tool (opt-in)
+
+Some agents read files with the shell (`cat file`, `sed -n '100,160p' file`) instead of a file tool. With
+`CTX_SEG_TERMINAL=cat`, `slice` or `cat,slice` the gateway also names the output of such a call, when the command only
+prints files: every part of the command (split on `&&` and `;`) must be `cat`, `sed -n 'a,bp'`, `head`, `tail`,
+`nl | sed -n` or `cat | head`, optionally after `cd` and `echo` separators. A redirection, a pipe into another tool, a
+build, a search or a write makes the whole command not a read. The call must have succeeded (exit code 0). The shell tool's
+name is `CTX_SEG_TERMINAL_TOOLS` (default `terminal`; `bash` for some agents). A whole file must reach
+`CTX_SEG_MIN_CHARS` (4000), a slice `CTX_SEG_SLICE_MIN_CHARS` (3000).
+
+Off by default, because it rarely pays. A stored image costs about 70 MB plus 18 KB per token whatever the size of the
+text, so a 1,000-token slice costs the same disk as a 7,000-token file for a gain of under a second. Measured on a
+3 h 11 Hermes session on a Rust codebase (57 file reads: 14 `cat`, 7 `read_file`, 24 `sed -n` slices, 12 `head`/`tail`):
+
+| | |
+|---|---|
+| Reads whose output came back as identical text | 2 of 57 (about 6 s of prompt reading) |
+| Stored images this detection would have added | 8 for `cat` (1.1 GB), 12 for slices (1.1 GB) |
+| Loads it would have produced inside the session | 1 for `cat`, 0 for slices |
+
+It can only help when the same unchanged text comes back: a file re-read after a compaction or in a later session. Turn it
+on for `cat` if your agent re-reads whole files across sessions; leave `slice` off unless your slices are large and repeated.
+`bench/hermes-local/exact_repeats.py` measures this on your own recordings.
+
 ## Install
 
 1. Strata: use the `file-state-cache` branch of the fork https://github.com/themimi974/Strata (or apply

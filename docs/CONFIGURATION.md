@@ -64,6 +64,14 @@ File state cache (research, needs the Strata build with `strata_segx`; see [FILE
 | `CTX_SEG_TOOLS` | `read_file,skill_view` (compose) | tool names whose results are files or skills (comma list or JSON list); Hermes: `read_file`, `skill_view` |
 | `CTX_SEG_MIN_CHARS` | `4000` | smaller tool results are just read |
 
+Reads made with a shell tool (see [FILE-CACHE.md](FILE-CACHE.md)):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CTX_SEG_TERMINAL` | empty (off) | `cat`, `slice` or `cat,slice`: also cache the output of a shell command that only prints files |
+| `CTX_SEG_TERMINAL_TOOLS` | `terminal` | name(s) of the shell tool (comma list or JSON list) |
+| `CTX_SEG_SLICE_MIN_CHARS` | `3000` | a slice below this is just read (a stored image costs ~70 MB) |
+
 ## Compose (`deploy/.env`)
 
 | Variable | Meaning |

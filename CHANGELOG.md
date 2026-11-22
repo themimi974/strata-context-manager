@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+* File cache: opt-in detection of file reads made with a shell tool (`CTX_SEG_TERMINAL=cat,slice`, `CTX_SEG_TERMINAL_TOOLS`,
+  `CTX_SEG_SLICE_MIN_CHARS`). Strict command parsing: only commands that print files are taken for reads. A text that
+  appears twice in one request is named once. Off by default; see docs/FILE-CACHE.md for when it pays.
+* bench/hermes-local: `readstyle.py`, `partial_reads.py`, `exact_repeats.py` (how an agent reads files, what it costs).
+
 ## 0.2.0 (2026-11-22)
 
 * File state cache (research, off by default, `CTX_SEG=1`): files the agent already read load from a stored state
