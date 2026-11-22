@@ -56,6 +56,8 @@ class StrataContextHook(CustomLogger):
             body = r.json() if r.status_code == 200 else {}
             if isinstance(body.get("messages"), list) and body["messages"]:   # volatile lines moved (CTX_REORDER=1)
                 data["messages"] = body["messages"]
+            if isinstance(body.get("segx"), dict) and body["segx"].get("files"):   # F4: file state cache
+                data["strata_segx"] = body["segx"]   # top level, like strata_prefix (LiteLLM forwards it)
             if isinstance(body.get("pin"), dict):                               # tier-0 pin (CTX_PIN_SYSTEM=1)
                 # top level, not extra_body: LiteLLM's proxy drops an extra_body set in a pre-call hook, while it
                 # forwards unknown top-level keys to an openai/ backend

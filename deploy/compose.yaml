@@ -62,6 +62,9 @@ services:
       CTX_SAVE_MIN_TOKENS: ${CTX_SAVE_MIN_TOKENS:-8192}
       CTX_SAVE_STEP_TOKENS: ${CTX_SAVE_STEP_TOKENS:-8192}
       CTX_RESTORE_MIN_GAIN: ${CTX_RESTORE_MIN_GAIN:-2048}
+      CTX_SEG: ${CTX_SEG:-0}                 # file state cache: needs the Strata research build (strata_segx)
+      CTX_SEG_TOOLS: ${CTX_SEG_TOOLS:-read_file}
+      CTX_SEG_MIN_CHARS: ${CTX_SEG_MIN_CHARS:-4000}
       CTX_RECORD: ${CTX_RECORD:-}             # benchmark: e.g. /bench/requests.jsonl (mount a folder below)
     # volumes:
     #   - ./bench-data:/bench
