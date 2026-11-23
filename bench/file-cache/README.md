@@ -15,3 +15,7 @@ server. Paths are the lab's (`/root/Strata-f1`, `/nvme/f1`); adapt them before u
 | f37 | Clean capture vs capture inside the conversation; whether an edge-check signal predicts drift |
 
 `replay_blocks.json` (a recorded Hermes conversation used by the compaction replay) is not included.
+
+`readcache_e2e.py SOURCE_FILE` checks the shell-read cache end to end without an agent: two different conversations show the
+same `cat` and the same `sed -n` slice; the gateway must name each one and Strata must store it the first time and load it the
+second (read the `segx` lines in Strata's log). It calls the gateway with `pct exec 105` and Strata at its LAN address: adapt both.
