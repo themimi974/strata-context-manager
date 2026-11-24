@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* Engine: the file-state cache is rebased onto Strata v0.2.19 (fork branch `file-state-cache-0.2.19`). On an MI100 the
+  new release reads prompts at the same speed as v0.2.16 (about 820 tok/s, +1 %); its prefill gains are for NVIDIA and
+  RDNA cards. Build note: `-DSTRATA_BUILD_INKLING2=OFF` on HIP.
 * File cache: opt-in detection of file reads made with a shell tool (`CTX_SEG_TERMINAL=cat,slice`, `CTX_SEG_TERMINAL_TOOLS`,
   `CTX_SEG_SLICE_MIN_CHARS`). Strict command parsing: only commands that print files are taken for reads. A text that
   appears twice in one request is named once. Off by default; see docs/FILE-CACHE.md for when it pays.

@@ -74,8 +74,9 @@ on for `cat` if your agent re-reads whole files across sessions; leave `slice` o
 
 ## Install
 
-1. Strata: use the `file-state-cache` branch of the fork https://github.com/themimi974/Strata (or apply
-   `engine/strata-patches/*.patch` on Strata `v0.2.16-4-g58ee32277` with `git am`), build (MI100 build options: `FILE-STATE-CACHE.md` in that branch), run with
+1. Strata: use the `file-state-cache-0.2.19` branch of the fork https://github.com/themimi974/Strata (Strata v0.2.19;
+   the older `file-state-cache` branch is on v0.2.16, or apply `engine/strata-patches/*.patch` on Strata
+   `v0.2.16-4-g58ee32277` with `git am`), build (MI100 build options: `FILE-STATE-CACHE.md` in that branch), run with
    `STRATA_SEGSTORE=/nvme/strata-segments` in the config's `env`.
 2. Janitor: copy `engine/strata-segments-janitor.sh` to `/usr/local/bin/strata-segments-janitor` and add the cron
    line from its header. Settings in `/etc/default/strata-context`: `SEG_DIR`, `SEG_BUDGET_GB`.
