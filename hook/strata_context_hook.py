@@ -15,21 +15,37 @@ system-prompt lines moved, see CTX_REORDER). After a successful request the hook
 
 The hook never fails a request: if the Context Manager is down or slow, the request goes to Strata unchanged.
 
+When Strata ends a request because the GPU failed (a "launch failure" during a copy, which Strata reports as a
+checkpoint or snapshot error with HTTP 400), the hook turns the error into HTTP 503 with Retry-After: the request was
+valid and Strata's watchdog restarts the engine, so a client that retries 5xx carries on instead of stopping on a 400.
+
 Environment:
   CONTEXT_MANAGER_URL            default http://context-manager:8090
   CONTEXT_MANAGER_TIMEOUT_S      default 2      (result reports)
   CONTEXT_MANAGER_OBSERVE_TIMEOUT_S default 60  (the pre-call may restore a snapshot first: ~3 s for 120K tokens)
+  STRATA_GPU_FAULT_RETRY_AFTER_S default 60  (Retry-After of the 503; 0 leaves Strata's error unchanged)
 """
 import os
 import uuid
 
 import httpx
+from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
 CM_URL = os.environ.get("CONTEXT_MANAGER_URL", "http://context-manager:8090").rstrip("/")
 TIMEOUT = float(os.environ.get("CONTEXT_MANAGER_TIMEOUT_S", "2"))
 OBSERVE_TIMEOUT = float(os.environ.get("CONTEXT_MANAGER_OBSERVE_TIMEOUT_S", "60"))
 ID_KEY = "strata_context_id"
+RETRY_AFTER = int(os.environ.get("STRATA_GPU_FAULT_RETRY_AFTER_S", "60"))
+# Strata's messages when the GPU, not the request, failed (engine/src/program/generate.cpp, conversation_*.cpp)
+GPU_FAULT_MARKERS = ("unspecified launch failure", "illegal memory access", "saving a conversation checkpoint failed",
+                     "hipErrorLaunchFailure", "hipErrorIllegalAddress")
+
+
+def gpu_fault(exc):
+    """Whether an upstream error is a GPU fault reported by Strata (the request itself was fine)."""
+    text = str(exc)
+    return any(m in text for m in GPU_FAULT_MARKERS)
 
 
 def _ms(a, b):
@@ -84,6 +100,17 @@ class StrataContextHook(CustomLogger):
             })
         except Exception:
             pass
+
+    async def async_post_call_failure_hook(self, request_data, original_exception, user_api_key_dict,
+                                           traceback_str=None):
+        try:
+            if RETRY_AFTER > 0 and gpu_fault(original_exception):
+                return HTTPException(status_code=503, headers={"Retry-After": str(RETRY_AFTER)}, detail=(
+                    "Strata's GPU failed during this request and the engine is restarting; retry in "
+                    f"{RETRY_AFTER} s. Upstream: {str(original_exception)[:300]}"))
+        except Exception:
+            pass
+        return None
 
 
 handler = StrataContextHook()

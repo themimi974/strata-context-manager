@@ -17,6 +17,7 @@ services:
       - "${LITELLM_BIND:-}${LITELLM_PORT:-4000}:4000"
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
+      - ../hook/strata_context_hook.py:/app/strata_context_hook.py:ro   # the repo's hook, not the image's copy
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set LITELLM_SALT_KEY in .env}

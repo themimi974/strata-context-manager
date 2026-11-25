@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+* Hook: when Strata ends a request because the GPU failed (a launch failure during a copy, reported as a checkpoint or
+  snapshot error with HTTP 400), the client now gets HTTP 503 with `Retry-After` (`STRATA_GPU_FAULT_RETRY_AFTER_S`,
+  default 60), so agents that retry 5xx carry on while the watchdog restarts the engine. Two runs of a Hermes task
+  stopped on that 400. `deploy/compose.yaml` mounts the repo's hook into the LiteLLM container.
 * Engine: the file-state cache is rebased onto Strata v0.2.19 (fork branch `file-state-cache-0.2.19`). On an MI100 the
   new release reads prompts at the same speed as v0.2.16 (about 820 tok/s, +1 %); its prefill gains are for NVIDIA and
   RDNA cards. Build note: `-DSTRATA_BUILD_INKLING2=OFF` on HIP.
