@@ -37,26 +37,116 @@ One run per setup; method, raw numbers and limits in [docs/BENCHMARK.md](docs/BE
 
 ```mermaid
 flowchart LR
-  A[Agent<br/>Hermes, OpenCode, ...] -->|OpenAI API| L[LiteLLM<br/>+ strata_context_hook]
-  L -->|observe / result| C[Context Manager]
-  C --> P[(PostgreSQL)]
-  L -->|chat request| S[Strata server]
-  C -->|save / restore slot| S
-  S --- D[(NVMe<br/>snapshot files)]
-  J[janitor, cron] -->|eviction order| C
-  J --> D
+  A["Agent<br/>Hermes, OpenCode, ..."] -->|"OpenAI chat request"| H
+
+  subgraph GW["LiteLLM gateway"]
+    H["strata_context_hook<br/>pre-call: POST /v1/observe<br/>success: POST /v1/result<br/>GPU fault: 400 → 503 + Retry-After"]
+  end
+
+  subgraph CM["Context Manager · FastAPI"]
+    O["observe<br/>1 canonicalise volatile lines<br/>2 cut into content-hashed blocks<br/>3 match a known conversation"]
+    RP["restore policy<br/>deepest matching snapshot"]
+    FF["file finder · segments.py<br/>read_file / skill_view results<br/>opt-in: shell cat / slices<br/>id = sha256(validity root, exact text)"]
+    RS["result<br/>tokens, timings<br/>save policy"]
+  end
+
+  subgraph DB["PostgreSQL"]
+    T1[("request_log<br/>context_block, chain_node")]
+    T2[("kv_snapshot")]
+    T3[("file_segment<br/>id, tool, chars, seen_count")]
+  end
+
+  subgraph ENG["Strata host · GPU"]
+    S["server + engine<br/>prefix cache"]
+    SL["slot save / restore<br/>whole conversation"]
+    SX["strata_segx · fork only<br/>per file: load or read + capture"]
+    W["watchdog<br/>restarts after a GPU reset"]
+  end
+
+  subgraph NV["NVMe"]
+    D1[("strata-slots/<br/>conversation snapshots")]
+    D2[("strata-segments/v2-&lt;id&gt;<br/>file states")]
+  end
+
+  H --> O
+  O --> RP
+  O --> FF
+  RP -->|"restore slot"| SL
+  FF -->|"strata_segx: files + ids<br/>(via the hook)"| H
+  H -->|"chat request<br/>+ strata_segx"| S
+  S --> SX
+  H --> RS
+  RS -->|"save slot"| SL
+  O --- T1
+  RP --- T2
+  RS --- T2
+  FF --- T3
+  SL --- D1
+  SX --- D2
+  W -.-> S
+  J1["slots janitor · cron"] -->|"eviction order"| CM
+  J1 --> D1
+  J2["segments janitor · cron<br/>budget, least recently used"] --> D2
 ```
 
-* **LiteLLM hook**: before each request, tells the Context Manager what is about to be sent; after it, reports tokens
-  and timings. It never fails a request.
-* **Context Manager** (FastAPI + Postgres): cuts each request into content-hashed blocks, recognises conversations it
-  has seen, restores the deepest matching snapshot when Strata has lost the conversation, and saves new snapshots of
-  long conversations.
-* **Strata**: does the work. Snapshots use Strata's slot save/restore (`--slot-save-path`); no Strata patch is needed (only the optional file cache below uses a Strata fork).
-* **Engine-side tools** (optional): a watchdog that restarts Strata cleanly after a GPU reset, and a janitor that keeps
-  the snapshot folder under a size budget.
+* **LiteLLM hook**: before each request, sends the messages to the Context Manager's `/v1/observe` and adds what it
+  answers to the request (`strata_segx` for the file cache, `strata_prefix` for the optional pin, the canonicalised
+  messages when `CTX_REORDER=1`). After the request, reports tokens and timings to `/v1/result`. It never fails a
+  request; when Strata ends one because the GPU faulted, the client gets 503 with `Retry-After` so the agent retries
+  instead of stopping.
+* **Context Manager** (FastAPI + Postgres), two independent caches:
+  * **conversation snapshots**: cuts each request into content-hashed blocks, recognises conversations it has seen,
+    restores the deepest matching snapshot when Strata has lost the conversation (restart, GPU reset, another
+    conversation in between), and saves new snapshots of long conversations after the request.
+  * **file finder** (`CTX_SEG=1`, optional): finds the file reads in the request (tool results of `CTX_SEG_TOOLS`,
+    and with `CTX_SEG_TERMINAL` shell commands that only print a file) and names each one by a hash of the exact text
+    and the validity root (model, weights, quantisation, engine, template). It records them in `file_segment` and
+    sends `strata_segx: {"files": [{message, start, end, id}]}`. It keeps no record of what Strata stored: a wrong
+    guess only costs a normal read.
+* **Strata**: does the work. Snapshots use Strata's slot save/restore (`--slot-save-path`), no patch needed. The file
+  cache needs the fork (below): for each file in `strata_segx` that is not already in the reused prefix, Strata loads
+  `v2-<id>` when its stored tokens equal the request's, else it reads the file normally and captures it under that id.
+* **Engine-side tools** (optional): a watchdog that restarts Strata cleanly after a GPU reset, a janitor that keeps the
+  snapshot folder under a size budget (it asks the Context Manager which snapshots are worth least), and a janitor that
+  keeps the file-state folder under its own budget, least recently used first.
 
-Details: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+### One request, step by step
+
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant H as LiteLLM hook
+  participant C as Context Manager
+  participant S as Strata
+  participant N as NVMe
+  A->>H: chat request (messages, tools)
+  H->>C: POST /v1/observe
+  C->>C: blocks, match conversation, find file reads
+  opt Strata lost this conversation
+    C->>S: restore slot (deepest matching snapshot)
+    S->>N: read the snapshot file (strata-slots)
+  end
+  C-->>H: strata_segx (file ids), optional pin
+  H->>S: chat request + strata_segx
+  loop each file not already in the reused prefix
+    alt state stored under this id, same tokens
+      S->>N: load file state (~0.5 s for 9K tokens)
+    else
+      S->>S: read the file normally
+      S->>N: capture the file state under its id
+    end
+  end
+  S-->>H: answer, token counts, timings
+  H-->>A: answer
+  H->>C: POST /v1/result
+  opt long conversation, enough new tokens
+    C->>S: save slot
+    S->>N: write the snapshot file (strata-slots)
+  end
+```
+
+Details: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
+[docs/FILE-CACHE.md](docs/FILE-CACHE.md)
 
 ## File state cache (optional, research)
 
@@ -77,7 +167,10 @@ The file's first 15 % and last few tokens are read normally to stitch it to its 
 does not match the file token for token, the file is simply read; a request never fails because of the cache.
 
 This needs a modified Strata: the fork [themimi974/Strata](https://github.com/themimi974/Strata), branch
-[`file-state-cache`](https://github.com/themimi974/Strata/tree/file-state-cache). Switch it on with `CTX_SEG=1`.
+[`file-state-cache-0.2.19`](https://github.com/themimi974/Strata/tree/file-state-cache-0.2.19) (Strata v0.2.19; the
+older [`file-state-cache`](https://github.com/themimi974/Strata/tree/file-state-cache) is on v0.2.16). Switch it on with
+`CTX_SEG=1`. Reads made with a shell tool (`cat`, `sed -n` slices) are opt-in with `CTX_SEG_TERMINAL`; see
+[docs/FILE-CACHE.md](docs/FILE-CACHE.md) for when that pays.
 
 | Re-reading a 23K-character file in a new Hermes session (live, 22 Nov 2026) | Normal read | From the cache |
 |---|---:|---:|

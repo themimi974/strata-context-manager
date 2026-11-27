@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* README: "How it fits together" redrawn with the file-state cache (file finder, `file_segment`, `strata_segx`,
+  the fork's load-or-capture step, the segments store and its janitor) and a step-by-step diagram of one request.
 * Hook: when Strata ends a request because the GPU failed (a launch failure during a copy, reported as a checkpoint or
   snapshot error with HTTP 400), the client now gets HTTP 503 with `Retry-After` (`STRATA_GPU_FAULT_RETRY_AFTER_S`,
   default 60), so agents that retry 5xx carry on while the watchdog restarts the engine. Two runs of a Hermes task
